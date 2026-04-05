@@ -1,6 +1,6 @@
 "use client";
 
-import { startTransition, useDeferredValue, useRef, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useRef, useState } from "react";
 
 import { ChatMessageContent } from "@/components/chat-message-content";
 import { resolveAssistantFinalMessage } from "@/components/chat-stream";
@@ -92,6 +92,11 @@ const normalizeProviderLabel = (label: string) => {
   return label;
 };
 
+const roleLabel: Record<ChatMessage["role"], string> = {
+  user: "我",
+  assistant: "小行星",
+};
+
 const formatErrorMessage = (message: string) => {
   if (message.includes("429")) {
     return "上游模型限流（429），请稍后重试，或切换到更稳定的模型配置。";
@@ -141,6 +146,8 @@ const toolResultDetail = (toolResult: ToolResult) => {
   return "";
 };
 
+const AUTO_FOLLOW_THRESHOLD = 160;
+
 export function ChatWorkspace() {
   const [bootSession] = useState<SessionSummary>(() => createSession());
   const [sessions, setSessions] = useState<SessionSummary[]>(() => [bootSession]);
@@ -148,23 +155,61 @@ export function ChatWorkspace() {
   const [messagesBySession, setMessagesBySession] = useState<
     Record<string, ChatMessage[]>
   >(() => ({ [bootSession.id]: [] }));
-  const [activityBySession, setActivityBySession] = useState<
-    Record<string, ActivityItem[]>
-  >(() => ({ [bootSession.id]: [] }));
+  const [, setActivityBySession] = useState<Record<string, ActivityItem[]>>(() => ({
+    [bootSession.id]: [],
+  }));
   const [streamingDraftBySession, setStreamingDraftBySession] = useState<
     Record<string, StreamingDraft | undefined>
   >(() => ({ [bootSession.id]: undefined }));
   const [draft, setDraft] = useState(INITIAL_PROMPT);
   const [status, setStatus] = useState("准备就绪");
-  const [providerLabel, setProviderLabel] = useState("OpenAI Compatible");
+  const [, setProviderLabel] = useState("OpenAI Compatible");
   const [activeRun, setActiveRun] = useState<ActiveRunState | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [shouldAutoFollow, setShouldAutoFollow] = useState(true);
   const activeControllerRef = useRef<AbortController | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollingRef = useRef(false);
+  const autoScrollingTimeoutRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
 
   const activeMessages = messagesBySession[activeSessionId] ?? [];
   const deferredMessages = useDeferredValue(activeMessages);
-  const activeActivities = activityBySession[activeSessionId] ?? [];
   const activeStreamingDraft = streamingDraftBySession[activeSessionId];
+  const hasStreamingDraft = activeStreamingDraft !== undefined;
   const isStreaming = activeRun !== null;
+
+  const isNearBottom = () => {
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      return true;
+    }
+
+    const remaining =
+      timeline.scrollHeight - (timeline.scrollTop + timeline.clientHeight);
+    return remaining <= AUTO_FOLLOW_THRESHOLD;
+  };
+
+  const scrollToLatest = (behavior: ScrollBehavior = "auto") => {
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      return;
+    }
+
+    autoScrollingRef.current = true;
+    if (autoScrollingTimeoutRef.current !== null) {
+      window.clearTimeout(autoScrollingTimeoutRef.current);
+    }
+    timeline.scrollTo({
+      top: timeline.scrollHeight,
+      behavior,
+    });
+    autoScrollingTimeoutRef.current = window.setTimeout(() => {
+      autoScrollingRef.current = false;
+      autoScrollingTimeoutRef.current = null;
+    }, 140);
+  };
 
   const upsertSession = (sessionId: string, title: string) => {
     setSessions((current) => {
@@ -212,6 +257,113 @@ export function ChatWorkspace() {
       ...current,
       [sessionId]: undefined,
     }));
+  };
+
+  useEffect(() => {
+    const pauseAutoFollow = () => {
+      autoScrollingRef.current = false;
+      if (autoScrollingTimeoutRef.current !== null) {
+        window.clearTimeout(autoScrollingTimeoutRef.current);
+        autoScrollingTimeoutRef.current = null;
+      }
+      setShouldAutoFollow(false);
+    };
+
+    const handleScroll = () => {
+      if (!isStreaming || autoScrollingRef.current) {
+        return;
+      }
+
+      const nextShouldAutoFollow = isNearBottom();
+      setShouldAutoFollow((current) =>
+        current === nextShouldAutoFollow ? current : nextShouldAutoFollow,
+      );
+    };
+
+    const handleWheel = (event: WheelEvent) => {
+      if (!isStreaming) {
+        return;
+      }
+
+      if (event.deltaY < 0) {
+        pauseAutoFollow();
+      }
+    };
+
+    const handleTouchStart = (event: TouchEvent) => {
+      touchStartYRef.current = event.touches[0]?.clientY ?? null;
+    };
+
+    const handleTouchMove = (event: TouchEvent) => {
+      if (!isStreaming) {
+        return;
+      }
+
+      const currentY = event.touches[0]?.clientY;
+      const startY = touchStartYRef.current;
+      if (currentY === undefined || startY === null) {
+        return;
+      }
+
+      if (currentY - startY > 6) {
+        pauseAutoFollow();
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!isStreaming) {
+        return;
+      }
+
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+        pauseAutoFollow();
+      }
+    };
+
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      return;
+    }
+
+    timeline.addEventListener("scroll", handleScroll, { passive: true });
+    timeline.addEventListener("wheel", handleWheel, { passive: true });
+    timeline.addEventListener("touchstart", handleTouchStart, { passive: true });
+    timeline.addEventListener("touchmove", handleTouchMove, { passive: true });
+    timeline.addEventListener("keydown", handleKeyDown);
+    return () => {
+      timeline.removeEventListener("scroll", handleScroll);
+      timeline.removeEventListener("wheel", handleWheel);
+      timeline.removeEventListener("touchstart", handleTouchStart);
+      timeline.removeEventListener("touchmove", handleTouchMove);
+      timeline.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isStreaming]);
+
+  useEffect(() => {
+    if (!shouldAutoFollow) {
+      return;
+    }
+
+    scrollToLatest(hasStreamingDraft ? "auto" : "smooth");
+  }, [
+    activeSessionId,
+    activeStreamingDraft?.content,
+    activeStreamingDraft?.status,
+    deferredMessages.length,
+    hasStreamingDraft,
+    shouldAutoFollow,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (autoScrollingTimeoutRef.current !== null) {
+        window.clearTimeout(autoScrollingTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const closeSidebar = () => {
+    setIsSidebarOpen(false);
   };
 
   const stopCurrentRun = () => {
@@ -395,6 +547,7 @@ export function ChatWorkspace() {
     clearStreamingDraft(sessionId);
     setProviderLabel("OpenAI Compatible");
     setStatus("正在提交请求...");
+    setShouldAutoFollow(true);
     appendActivity(sessionId, createActivity("run", "用户发起请求", content));
 
     const userMessage = createLocalMessage("user", content);
@@ -490,18 +643,48 @@ export function ChatWorkspace() {
       setStatus("已新建一条对话。");
       setDraft("");
       setProviderLabel("OpenAI Compatible");
+      setShouldAutoFollow(true);
     });
   };
 
+  const handleSelectSession = (sessionId: string) => {
+    setActiveSessionId(sessionId);
+    setShouldAutoFollow(true);
+    closeSidebar();
+  };
+
+  const activeTitle =
+    sessions.find((session) => session.id === activeSessionId)?.title ?? "新对话";
+
   return (
     <div className={styles.shell}>
-      <aside className={styles.sidebar}>
-        <div className={styles.logoRow}>
-          <div className={styles.logoMark}>A</div>
-          <div>
-            <div className={styles.logoTitle}>Agent Workspace</div>
-            <div className={styles.logoSub}>可观测的流式聊天工作台</div>
+      <button
+        aria-hidden={!isSidebarOpen}
+        className={styles.sidebarBackdrop}
+        data-open={isSidebarOpen}
+        onClick={closeSidebar}
+        tabIndex={isSidebarOpen ? 0 : -1}
+        type="button"
+      />
+
+      <aside className={styles.sidebar} data-open={isSidebarOpen}>
+        <div className={styles.sidebarTop}>
+          <div className={styles.brandBlock}>
+            <div className={styles.logoMark}>小</div>
+            <div>
+              <div className={styles.logoTitle}>小行星</div>
+              <div className={styles.logoSub}>你的中文智能对话空间</div>
+            </div>
           </div>
+
+          <button
+            aria-label="收起历史对话"
+            className={styles.iconButton}
+            onClick={closeSidebar}
+            type="button"
+          >
+            ×
+          </button>
         </div>
 
         <button
@@ -513,14 +696,14 @@ export function ChatWorkspace() {
           新建对话
         </button>
 
-        <div className={styles.sessionHeader}>最近会话</div>
+        <div className={styles.sessionHeader}>对话记录</div>
         <div className={styles.sessionList}>
           {sessions.map((session) => (
             <button
               className={styles.sessionButton}
               data-active={session.id === activeSessionId}
               key={session.id}
-              onClick={() => setActiveSessionId(session.id)}
+              onClick={() => handleSelectSession(session.id)}
               type="button"
             >
               <span className={styles.sessionName}>{session.title}</span>
@@ -528,39 +711,53 @@ export function ChatWorkspace() {
             </button>
           ))}
         </div>
-
-        <div className={styles.sidebarFooter}>
-          <div className={styles.sidebarLabel}>Provider</div>
-          <div className={styles.sidebarValue}>{providerLabel}</div>
-        </div>
       </aside>
 
       <main className={styles.main}>
-        <header className={styles.hero}>
-          <div className={styles.heroInner}>
-            <span className={styles.eyebrow}>Observable Agent Chat</span>
-            <h1 className={styles.heroHeadline}>查询重写、评分门控与混合检索都可实时查看</h1>
-            <p className={styles.heroBody}>
-              这一版把工具路由、知识库检索、天气查询、网页检索、文档评分、查询重写和 rerank
-              都接进了同一条可观测链路。前端会在回答生成前持续展示每一步细节，而不是静默等待。
-            </p>
+        <header className={styles.topbar}>
+          <div className={styles.topbarLeft}>
+            <button
+              aria-label="展开历史对话"
+              className={styles.iconButton}
+              onClick={() => setIsSidebarOpen(true)}
+              type="button"
+            >
+              ☰
+            </button>
+            <button
+              className={styles.topNewButton}
+              disabled={isStreaming}
+              onClick={createFreshSession}
+              type="button"
+            >
+              新建对话
+            </button>
           </div>
+
+          <div className={styles.topbarTitle}>小行星</div>
         </header>
 
-        <section className={styles.workspace}>
-          <div className={styles.timelineWrap}>
-            <div className={styles.timelineHeader}>
+        <section className={styles.chatStage}>
+          <div className={styles.chatFrame}>
+            <div className={styles.chatHeader}>
               <div>
-                <div className={styles.sectionLabel}>Conversation</div>
-                <div className={styles.sectionTitle}>对话记录</div>
+                <div className={styles.sectionTitle}>{activeTitle}</div>
+                <div className={styles.sectionMeta}>对话记录</div>
               </div>
               <div className={styles.statusBadge}>{status}</div>
             </div>
 
-            <div className={styles.timeline}>
+            <div
+              className={styles.timeline}
+              ref={timelineRef}
+              tabIndex={0}
+            >
               {deferredMessages.length === 0 && !activeStreamingDraft ? (
                 <div className={styles.empty}>
-                  输入一个问题开始聊天。你可以直接问最新新闻、天气，或要求系统从知识库里找答案。
+                  <div className={styles.emptyTitle}>今天想聊点什么？</div>
+                  <div className={styles.emptyBody}>
+                    在这里输入问题，小行星会把回答留在页面中央，输入框也会始终跟着你。
+                  </div>
                 </div>
               ) : (
                 <div className={styles.timelineInner}>
@@ -571,7 +768,7 @@ export function ChatWorkspace() {
                       key={message.id}
                     >
                       <div className={styles.messageMeta}>
-                        <span>{message.role}</span>
+                        <span>{roleLabel[message.role]}</span>
                         <span>{formatTime(message.createdAt)}</span>
                       </div>
                       <ChatMessageContent
@@ -585,8 +782,8 @@ export function ChatWorkspace() {
                     <article className={styles.message} data-role="assistant">
                       <div className={styles.messageMeta}>
                         <span>
-                          assistant
-                          {activeStreamingDraft.status === "stopped" ? " · stopped" : ""}
+                          小行星
+                          {activeStreamingDraft.status === "stopped" ? " · 已停止" : ""}
                         </span>
                         <span>{formatTime(activeStreamingDraft.createdAt)}</span>
                       </div>
@@ -596,86 +793,56 @@ export function ChatWorkspace() {
                       />
                     </article>
                   ) : null}
+
+                  <div
+                    aria-hidden="true"
+                    className={styles.timelineAnchor}
+                    ref={bottomAnchorRef}
+                  />
                 </div>
               )}
             </div>
-          </div>
 
-          <aside className={styles.inspector}>
-            <section className={styles.panel}>
-              <div className={styles.sectionLabel}>Runtime</div>
-              <div className={styles.sectionTitle}>系统状态</div>
-              <div className={styles.panelValue}>{status}</div>
-            </section>
+            <section className={styles.composerDock}>
+              <div className={styles.composerSurface}>
+                <textarea
+                  className={styles.textarea}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                      event.preventDefault();
+                      if (isStreaming) {
+                        stopCurrentRun();
+                        return;
+                      }
+                      void submitPrompt();
+                    }
+                  }}
+                  placeholder="输入你的问题，例如：常见的前端和后端技术有哪些"
+                  value={draft}
+                />
 
-            <section className={styles.panel}>
-              <div className={styles.sectionLabel}>Activity</div>
-              <div className={styles.sectionTitle}>RAG 与工具过程</div>
-              <div className={styles.toolList}>
-                {activeActivities.length === 0 ? (
-                  <div className={styles.panelMuted}>
-                    这里会展示 routing、searching、grading、rewriting、reranking 等执行步骤。
+                <div className={styles.composerFooter}>
+                  <div className={styles.composerHint}>
+                    {isStreaming ? "正在生成回答，可随时停止" : "按 Cmd/Ctrl + Enter 发送"}
                   </div>
-                ) : (
-                  activeActivities
-                    .slice()
-                    .reverse()
-                    .map((activity) => (
-                      <details className={styles.toolItem} key={activity.id}>
-                        <summary className={styles.toolSummaryHeader}>
-                          <span className={styles.toolName}>{activity.title}</span>
-                          <span className={styles.toolTime}>{formatTime(activity.createdAt)}</span>
-                        </summary>
-                        <div className={styles.toolSummary}>{activity.body}</div>
-                        {activity.detail ? (
-                          <pre className={styles.toolDetail}>{activity.detail}</pre>
-                        ) : null}
-                      </details>
-                    ))
-                )}
+                  <button
+                    className={styles.sendButton}
+                    disabled={!isStreaming && !draft.trim()}
+                    onClick={() => {
+                      if (isStreaming) {
+                        stopCurrentRun();
+                        return;
+                      }
+                      void submitPrompt();
+                    }}
+                    type="button"
+                  >
+                    {isStreaming ? "停止生成" : "发送"}
+                  </button>
+                </div>
               </div>
             </section>
-          </aside>
-        </section>
-
-        <section className={styles.composer}>
-          <div className={styles.composerSurface}>
-            <textarea
-              className={styles.textarea}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                  event.preventDefault();
-                  if (isStreaming) {
-                    stopCurrentRun();
-                    return;
-                  }
-                  void submitPrompt();
-                }
-              }}
-              placeholder="输入你的问题，例如：帮我整理 AI agent 最近一周的重要动态，或者查一下上海天气。"
-              value={draft}
-            />
-
-            <div className={styles.composerFooter}>
-              <div className={styles.composerHint}>
-                {isStreaming ? "正在流式返回，可随时停止生成" : "按 Cmd/Ctrl + Enter 发送"}
-              </div>
-              <button
-                className={styles.sendButton}
-                disabled={!isStreaming && !draft.trim()}
-                onClick={() => {
-                  if (isStreaming) {
-                    stopCurrentRun();
-                    return;
-                  }
-                  void submitPrompt();
-                }}
-                type="button"
-              >
-                {isStreaming ? "停止生成" : "发送"}
-              </button>
-            </div>
           </div>
         </section>
       </main>
