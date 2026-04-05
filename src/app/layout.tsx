@@ -16,7 +16,7 @@ const monoFont = IBM_Plex_Mono({
 
 export const metadata: Metadata = {
   title: "Agent MVP Workspace",
-  description: "A local-first conversational agent workspace with web tools.",
+  description: "A local-first conversational agent workspace powered by an OpenAI-compatible API.",
 };
 
 export default function RootLayout({

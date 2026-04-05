@@ -1,11 +1,15 @@
 import * as cheerio from "cheerio";
 
 import { agentEnv } from "@/lib/agent/env";
+import { knowledgeBaseDocuments } from "@/lib/agent/knowledge-base";
 import type {
   FetchedPage,
+  RetrievalDocument,
   SearchProviderName,
   SearchResult,
   ToolErrorType,
+  ToolProgress,
+  WeatherResult,
 } from "@/lib/agent/types";
 
 export class SearchToolError extends Error {
@@ -13,7 +17,6 @@ export class SearchToolError extends Error {
     message: string,
     public readonly type: ToolErrorType,
     public readonly provider: SearchProviderName,
-    public readonly userMessage: string,
     public readonly detail?: string,
   ) {
     super(message);
@@ -25,66 +28,96 @@ export interface SearchResponse {
   provider: SearchProviderName;
   results: SearchResult[];
   filteredResults: SearchResult[];
-  attempts: Array<{
-    provider: SearchProviderName;
-    ok: boolean;
-    errorType?: ToolErrorType;
-    detail?: string;
-  }>;
 }
 
-const SEARCH_PROVIDER_ORDER = ["search-api", "duckduckgo-html", "bing-rss"] as const;
+export interface KnowledgeBaseSearchResponse {
+  provider: "knowledge-base";
+  documents: RetrievalDocument[];
+  strategy: "hybrid" | "dense-only";
+  reranked: boolean;
+}
+
+const SEARCH_PROVIDER_ORDER: SearchProviderName[] = [
+  "search-api",
+  "duckduckgo-html",
+  "bing-rss",
+];
+
 const BLOCKED_DOMAINS = agentEnv.searchBlockedDomains.map((item) => item.toLowerCase());
 const DEMOTED_DOMAINS = agentEnv.searchDemotedDomains.map((item) => item.toLowerCase());
-const NEWS_KEYWORDS = agentEnv.searchNewsKeywords.map((item) => item.toLowerCase());
+const NEWS_KEYWORDS = [
+  "最新",
+  "最近",
+  "今天",
+  "今日",
+  "新闻",
+  "实时",
+  "搜一下",
+  "查一下",
+  "latest",
+  "recent",
+  "today",
+  "current",
+  "news",
+  "search",
+  "web",
+];
 const TRUSTED_NEWS_DOMAINS = [
   "reuters.com",
   "apnews.com",
   "bbc.com",
   "bbc.co.uk",
-  "cnn.com",
-  "nytimes.com",
   "theverge.com",
   "techcrunch.com",
   "wired.com",
   "36kr.com",
-  "huxiu.com",
-  "cls.cn",
-  "caixin.com",
   "ithome.com",
-  "sina.com.cn",
-  "qq.com",
-  "163.com",
-  "sohu.com",
-  "jiemian.com",
+  "caixin.com",
 ];
-const SEARCH_RETRY_COUNT = 2;
+
+const normalizeWhitespace = (value: string) =>
+  value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+
+const isAbortError = (error: unknown) =>
+  error instanceof Error &&
+  (error.name === "AbortError" || error.message.toLowerCase().includes("abort"));
+
+const throwIfAborted = (signal?: AbortSignal) => {
+  if (signal?.aborted) {
+    throw new SearchToolError("Request aborted.", "aborted", "search-api");
+  }
+};
 
 const withTimeout = async <T>(
   factory: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
-) => {
+  upstreamSignal?: AbortSignal,
+): Promise<T> => {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  const abortFromUpstream = () => controller.abort("upstream-abort");
+
+  upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
 
   try {
-    return await Promise.race([
-      factory(controller.signal),
-      new Promise<T>((_, reject) => {
-        controller.signal.addEventListener("abort", () => {
-          reject(new Error(`Timed out after ${timeoutMs}ms`));
-        });
-      }),
-    ]);
+    return await factory(controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted && upstreamSignal?.aborted) {
+      throw new SearchToolError("Request aborted.", "aborted", "search-api");
+    }
+    if (controller.signal.aborted) {
+      throw new SearchToolError(
+        `Timed out after ${timeoutMs}ms.`,
+        "timeout",
+        "search-api",
+      );
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
   }
 };
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const normalizeWhitespace = (value: string) =>
-  value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
 
 const safeDecode = (value: string) => {
   try {
@@ -102,6 +135,56 @@ const extractDomain = (rawUrl: string) => {
   }
 };
 
+const tokenize = (value: string) =>
+  normalizeWhitespace(value)
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
+    .filter(Boolean);
+
+const buildCharGrams = (value: string, size = 2) => {
+  const compact = normalizeWhitespace(value).toLowerCase().replace(/\s+/g, "");
+  const grams: string[] = [];
+
+  for (let index = 0; index <= compact.length - size; index += 1) {
+    grams.push(compact.slice(index, index + size));
+  }
+
+  return grams.length > 0 ? grams : compact ? [compact] : [];
+};
+
+const cosineFromCounters = (left: Map<string, number>, right: Map<string, number>) => {
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+
+  for (const [token, leftValue] of left.entries()) {
+    const rightValue = right.get(token) ?? 0;
+    dot += leftValue * rightValue;
+    leftNorm += leftValue * leftValue;
+  }
+
+  for (const rightValue of right.values()) {
+    rightNorm += rightValue * rightValue;
+  }
+
+  if (leftNorm === 0 || rightNorm === 0) {
+    return 0;
+  }
+
+  return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
+};
+
+const buildCounter = (tokens: string[]) => {
+  const counter = new Map<string, number>();
+  for (const token of tokens) {
+    counter.set(token, (counter.get(token) ?? 0) + 1);
+  }
+  return counter;
+};
+
+const reciprocalRankFusion = (...ranks: number[]) =>
+  ranks.reduce((total, rank) => total + 1 / (60 + rank), 0);
+
 const matchesDomainList = (domain: string, list: string[]) =>
   list.some((item) => domain === item || domain.endsWith(`.${item}`));
 
@@ -110,20 +193,37 @@ const isNewsLikeQuery = (query: string) => {
   return NEWS_KEYWORDS.some((keyword) => normalized.includes(keyword));
 };
 
-const normalizeSearchQuery = (query: string) => {
-  const trimmed = query.trim();
-  if (isNewsLikeQuery(trimmed) || /20\d{2}/.test(trimmed)) {
-    return trimmed.includes("新闻") ? trimmed : `${trimmed} 新闻`;
+const rankSearchResult = (result: SearchResult, isNewsQuery: boolean) => {
+  let score = 0;
+  const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
+  const signals: string[] = [];
+
+  if (isNewsQuery && NEWS_KEYWORDS.some((keyword) => haystack.includes(keyword))) {
+    score += 8;
+    signals.push("news-keyword");
   }
 
-  return trimmed;
+  if (matchesDomainList(result.domain, TRUSTED_NEWS_DOMAINS)) {
+    score += 10;
+    signals.push("trusted-domain");
+  }
+
+  if (matchesDomainList(result.domain, DEMOTED_DOMAINS)) {
+    score -= 8;
+    signals.push("demoted-domain");
+  }
+
+  if (/question|answer|问答|贴吧|community|forum/.test(haystack)) {
+    score -= 6;
+    signals.push("community-pattern");
+  }
+
+  result.rankingSignals = signals;
+  result.score = score;
+  return score;
 };
 
-const createSearchResult = (
-  title: string,
-  url: string,
-  snippet: string,
-): SearchResult => ({
+const createSearchResult = (title: string, url: string, snippet: string): SearchResult => ({
   title,
   url,
   snippet,
@@ -133,56 +233,31 @@ const createSearchResult = (
   rankingSignals: [],
 });
 
-const createSearchError = (
-  provider: SearchProviderName,
-  error: unknown,
-): SearchToolError => {
-  if (error instanceof SearchToolError) {
-    return error;
-  }
+const filterAndRankResults = (query: string, rawResults: SearchResult[]) => {
+  const filteredResults: SearchResult[] = [];
+  const ranked = rawResults
+    .map((result) => {
+      const blocked = matchesDomainList(result.domain, BLOCKED_DOMAINS);
+      if (blocked) {
+        filteredResults.push({
+          ...result,
+          fetchStatus: "skipped",
+          skipReason: "blocked-domain",
+          rankingSignals: ["blocked-domain"],
+        });
+        return null;
+      }
 
-  if (error instanceof Error) {
-    if (error.name === "AbortError" || error.message.startsWith("Timed out")) {
-      return new SearchToolError(
-        `Search request timed out for ${provider}.`,
-        "timeout",
-        provider,
-        "搜索工具超时了，请稍后重试或换个关键词。",
-        error.message,
-      );
-    }
+      const score = rankSearchResult(result, isNewsLikeQuery(query));
+      return { result, score };
+    })
+    .filter((entry): entry is { result: SearchResult; score: number } => Boolean(entry))
+    .sort((left, right) => right.score - left.score)
+    .slice(0, agentEnv.searchMaxResults)
+    .map((entry) => entry.result);
 
-    const lower = error.message.toLowerCase();
-    if (lower.includes("fetch failed") || lower.includes("network")) {
-      return new SearchToolError(
-        `Search request failed for ${provider}.`,
-        "network",
-        provider,
-        "搜索工具请求失败了，请稍后重试。",
-        error.message,
-      );
-    }
-  }
-
-  return new SearchToolError(
-    `Search request failed for ${provider}.`,
-    "unknown",
-    provider,
-    "搜索工具暂时不可用，请稍后再试。",
-    error instanceof Error ? error.message : String(error),
-  );
+  return { results: ranked, filteredResults };
 };
-
-const enabledProviders = Array.from(
-  new Set<SearchProviderName>(
-    agentEnv.searchProviders.filter((value): value is SearchProviderName =>
-      SEARCH_PROVIDER_ORDER.includes(value as SearchProviderName),
-    ),
-  ),
-);
-
-const orderedProviders =
-  enabledProviders.length > 0 ? enabledProviders : [...SEARCH_PROVIDER_ORDER];
 
 const decodeDuckDuckGoUrl = (href: string) => {
   if (href.startsWith("//")) {
@@ -207,28 +282,32 @@ const decodeXmlEntities = (value: string) =>
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
 
-const fetchSearchResponse = async (
-  provider: SearchProviderName,
+const fetchText = async (
   url: string,
-  signal: AbortSignal,
+  provider: SearchProviderName,
+  signal?: AbortSignal,
+  init?: RequestInit,
 ) => {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 Agent MVP",
-      Accept:
-        provider === "bing-rss"
-          ? "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8"
-          : "text/html,application/xhtml+xml",
-    },
+  const response = await withTimeout(
+    (innerSignal) =>
+      fetch(url, {
+        ...init,
+        headers: {
+          "User-Agent": "Mozilla/5.0 Agent Workspace",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9",
+          ...(init?.headers ?? {}),
+        },
+        signal: innerSignal,
+      }),
+    agentEnv.webFetchTimeoutMs,
     signal,
-  });
+  );
 
   if (!response.ok) {
     throw new SearchToolError(
-      `Search failed with status ${response.status} for ${provider}.`,
+      `Search failed with status ${response.status}.`,
       "http",
       provider,
-      "搜索服务返回了异常状态，请稍后重试。",
       `HTTP ${response.status}`,
     );
   }
@@ -236,126 +315,34 @@ const fetchSearchResponse = async (
   return response.text();
 };
 
-const rankSearchResult = (result: SearchResult, isNewsQuery: boolean) => {
-  let score = 0;
-  const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
-  const signals: string[] = [];
-
-  if (isNewsQuery) {
-    const matchingNewsKeyword = NEWS_KEYWORDS.find((keyword) => haystack.includes(keyword));
-    if (matchingNewsKeyword) {
-      score += 10;
-      signals.push(`news-keyword:${matchingNewsKeyword}`);
-    }
-  }
-
-  if (matchesDomainList(result.domain, TRUSTED_NEWS_DOMAINS)) {
-    score += 12;
-    signals.push("trusted-news-domain");
-  }
-
-  if (/20\d{2}|发布|报道|news|update|announc/i.test(haystack)) {
-    score += 4;
-    signals.push("timeliness-signal");
-  }
-
-  if (matchesDomainList(result.domain, DEMOTED_DOMAINS)) {
-    score -= 8;
-    signals.push("demoted-domain");
-  }
-
-  if (/question|answer|问答|知道|贴吧|community|forum/.test(haystack)) {
-    score -= 6;
-    signals.push("community-pattern");
-  }
-
-  result.rankingSignals = signals;
-  return score;
-};
-
-const filterAndRankResults = (query: string, rawResults: SearchResult[]) => {
-  const newsQuery = isNewsLikeQuery(query);
-  const filteredResults: SearchResult[] = [];
-
-  const ranked = rawResults
-    .map((result) => {
-      const blocked = matchesDomainList(result.domain, BLOCKED_DOMAINS);
-      if (blocked) {
-        filteredResults.push({
-          ...result,
-          fetchStatus: "skipped",
-          skipReason: "blocked-domain",
-          rankingSignals: ["blocked-domain"],
-        });
-        return null;
-      }
-
-      const score = rankSearchResult(result, newsQuery);
-      return { result, score };
-    })
-    .filter(
-      (
-        entry,
-      ): entry is {
-        result: SearchResult;
-        score: number;
-      } => Boolean(entry),
-    )
-    .sort((left, right) => right.score - left.score)
-    .map((entry) => entry.result)
-    .slice(0, agentEnv.searchMaxResults)
-    .map((result) => ({
-      ...result,
-      fetchStatus: "pending" as const,
-    }));
-
-  if (!ranked.length && filteredResults.length) {
-    throw new SearchToolError(
-      "All search results were blocked.",
-      "empty",
-      "search-api",
-      "搜索结果都来自明确受限的站点，请换个关键词再试。",
-      `Filtered ${filteredResults.length} blocked results.`,
-    );
-  }
-
-  return {
-    results: ranked,
-    filteredResults,
-  };
-};
-
-const searchApi = async (query: string, signal: AbortSignal) => {
-  const provider: SearchProviderName = "search-api";
-
+const searchWithSearchApi = async (query: string, signal?: AbortSignal) => {
   if (!agentEnv.searchApiKey) {
-    throw new SearchToolError(
-      "Search API key is missing.",
-      "unknown",
-      provider,
-      "主实时检索服务尚未配置，正在切换到备用搜索源。",
-    );
+    throw new SearchToolError("Search API key missing.", "unknown", "search-api");
   }
 
-  const response = await fetch(agentEnv.searchApiBaseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-KEY": agentEnv.searchApiKey,
-    },
-    body: JSON.stringify({
-      q: normalizeSearchQuery(query),
-      num: Math.max(agentEnv.searchMaxResults * 3, 10),
-    }),
+  const response = await withTimeout(
+    (innerSignal) =>
+      fetch(agentEnv.searchApiBaseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-KEY": agentEnv.searchApiKey,
+        },
+        body: JSON.stringify({
+          q: query,
+          num: Math.max(agentEnv.searchMaxResults * 2, 10),
+        }),
+        signal: innerSignal,
+      }),
+    agentEnv.webFetchTimeoutMs,
     signal,
-  });
+  );
 
   if (!response.ok) {
     throw new SearchToolError(
       `Search API failed with status ${response.status}.`,
       "http",
-      provider,
-      "主实时检索服务暂时不可用，正在切换到备用搜索源。",
+      "search-api",
       `HTTP ${response.status}`,
     );
   }
@@ -364,7 +351,7 @@ const searchApi = async (query: string, signal: AbortSignal) => {
     organic?: Array<{ title?: string; link?: string; snippet?: string }>;
   };
 
-  const results = (payload.organic ?? [])
+  const rawResults = (payload.organic ?? [])
     .map((item) => {
       const title = normalizeWhitespace(item.title ?? "");
       const url = normalizeWhitespace(item.link ?? "");
@@ -373,81 +360,56 @@ const searchApi = async (query: string, signal: AbortSignal) => {
     })
     .filter((entry): entry is SearchResult => Boolean(entry));
 
-  if (!results.length) {
-    throw new SearchToolError(
-      "Search API returned no results.",
-      "empty",
-      provider,
-      "主实时检索服务没有返回相关结果，正在尝试备用搜索源。",
-    );
+  if (!rawResults.length) {
+    throw new SearchToolError("Search API returned no results.", "empty", "search-api");
   }
 
-  const processed = filterAndRankResults(query, results);
-  return {
-    provider,
-    results: processed.results,
-    filteredResults: processed.filteredResults,
-  };
+  return filterAndRankResults(query, rawResults);
 };
 
-const searchDuckDuckGoHtml = async (query: string, signal: AbortSignal) => {
-  const provider: SearchProviderName = "duckduckgo-html";
-  const html = await fetchSearchResponse(
-    provider,
-    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(normalizeSearchQuery(query))}`,
+const searchWithDuckDuckGo = async (query: string, signal?: AbortSignal) => {
+  const html = await fetchText(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+    "duckduckgo-html",
     signal,
   );
 
   const $ = cheerio.load(html);
-  const results: SearchResult[] = [];
+  const rawResults: SearchResult[] = [];
 
   $(".result").each((_, element) => {
-    if (results.length >= agentEnv.searchMaxResults * 3) {
+    if (rawResults.length >= agentEnv.searchMaxResults * 2) {
       return false;
     }
 
     const titleNode = $(element).find(".result__title a").first();
-    const snippetNode = $(element).find(".result__snippet").first();
     const title = normalizeWhitespace(titleNode.text());
     const url = decodeDuckDuckGoUrl(titleNode.attr("href") ?? "");
-    const snippet = normalizeWhitespace(snippetNode.text());
+    const snippet = normalizeWhitespace($(element).find(".result__snippet").first().text());
 
     if (title && url) {
-      results.push(createSearchResult(title, url, snippet));
+      rawResults.push(createSearchResult(title, url, snippet));
     }
 
     return undefined;
   });
 
-  if (!results.length) {
-    throw new SearchToolError(
-      "DuckDuckGo HTML returned no results.",
-      "empty",
-      provider,
-      "备用搜索源没有找到结果。",
-      "No result items were parsed from the HTML response.",
-    );
+  if (!rawResults.length) {
+    throw new SearchToolError("DuckDuckGo returned no results.", "empty", "duckduckgo-html");
   }
 
-  const processed = filterAndRankResults(query, results);
-  return {
-    provider,
-    results: processed.results,
-    filteredResults: processed.filteredResults,
-  };
+  return filterAndRankResults(query, rawResults);
 };
 
-const searchBingRss = async (query: string, signal: AbortSignal) => {
-  const provider: SearchProviderName = "bing-rss";
-  const xml = await fetchSearchResponse(
-    provider,
-    `https://www.bing.com/search?format=rss&q=${encodeURIComponent(normalizeSearchQuery(query))}`,
+const searchWithBingRss = async (query: string, signal?: AbortSignal) => {
+  const xml = await fetchText(
+    `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`,
+    "bing-rss",
     signal,
   );
 
-  const itemMatches = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
-  const results = itemMatches
-    .slice(0, agentEnv.searchMaxResults * 3)
+  const rawResults = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
+    .slice(0, agentEnv.searchMaxResults * 2)
     .map((match) => {
       const block = match[1];
       const title = normalizeWhitespace(
@@ -457,156 +419,397 @@ const searchBingRss = async (query: string, signal: AbortSignal) => {
         decodeXmlEntities(block.match(/<link>([\s\S]*?)<\/link>/)?.[1] ?? ""),
       );
       const snippet = normalizeWhitespace(
-        decodeXmlEntities(
-          block.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? "",
-        ),
+        decodeXmlEntities(block.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? ""),
       );
-
       return title && url ? createSearchResult(title, url, snippet) : null;
     })
     .filter((entry): entry is SearchResult => Boolean(entry));
 
-  if (!results.length) {
-    throw new SearchToolError(
-      "Bing RSS returned no results.",
-      "empty",
-      provider,
-      "备用搜索源没有找到结果。",
-      "No RSS items were parsed from the response.",
-    );
+  if (!rawResults.length) {
+    throw new SearchToolError("Bing RSS returned no results.", "empty", "bing-rss");
   }
 
-  const processed = filterAndRankResults(query, results);
+  return filterAndRankResults(query, rawResults);
+};
+
+const runSearchProvider = async (
+  provider: SearchProviderName,
+  query: string,
+  signal?: AbortSignal,
+) => {
+  if (provider === "search-api") {
+    return searchWithSearchApi(query, signal);
+  }
+  if (provider === "duckduckgo-html") {
+    return searchWithDuckDuckGo(query, signal);
+  }
+  return searchWithBingRss(query, signal);
+};
+
+export const searchWeb = async ({
+  query,
+  signal,
+  onProgress,
+}: {
+  query: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: ToolProgress) => void;
+}): Promise<SearchResponse> => {
+  throwIfAborted(signal);
+
+  const providers = Array.from(
+    new Set(
+      agentEnv.searchProviders.filter((value): value is SearchProviderName =>
+        SEARCH_PROVIDER_ORDER.includes(value as SearchProviderName),
+      ),
+    ),
+  );
+
+  const orderedProviders = providers.length > 0 ? providers : SEARCH_PROVIDER_ORDER;
+  let lastError: SearchToolError | null = null;
+
+  for (const [index, provider] of orderedProviders.entries()) {
+    throwIfAborted(signal);
+    onProgress?.({
+      callId: "",
+      tool: "searchWeb",
+      message:
+        index === 0
+          ? `正在尝试 ${provider} 搜索源`
+          : `主搜索未命中，切换到 ${provider}`,
+      provider,
+      step: index + 1,
+      totalSteps: orderedProviders.length,
+    });
+
+    try {
+      const result = await runSearchProvider(provider, query, signal);
+      return { provider, ...result };
+    } catch (error) {
+      if (error instanceof SearchToolError) {
+        if (error.type === "aborted") {
+          throw error;
+        }
+        lastError = error;
+        continue;
+      }
+
+      if (isAbortError(error)) {
+        throw new SearchToolError("Request aborted.", "aborted", provider);
+      }
+
+      lastError = new SearchToolError(
+        "Search request failed.",
+        "unknown",
+        provider,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  throw (
+    lastError ??
+    new SearchToolError("Search request failed.", "unknown", orderedProviders[0] ?? "search-api")
+  );
+};
+
+export const fetchWebPage = async ({
+  url,
+  signal,
+}: {
+  url: string;
+  signal?: AbortSignal;
+}): Promise<FetchedPage> => {
+  throwIfAborted(signal);
+
+  try {
+    const html = await fetchText(url, "search-api", signal, {
+      redirect: "follow",
+    });
+    const $ = cheerio.load(html);
+
+    $("script, style, noscript, nav, footer, header, aside").remove();
+
+    const title = normalizeWhitespace($("title").first().text()) || url;
+    const description =
+      normalizeWhitespace(
+        $('meta[name="description"]').attr("content") ||
+          $('meta[property="og:description"]').attr("content") ||
+          "",
+      ) || "No description available.";
+    const text = normalizeWhitespace(
+      $("article").text() || $("main").text() || $("body").text(),
+    );
+
+    return {
+      title,
+      url,
+      description,
+      excerpt: text.slice(0, 1_600),
+    };
+  } catch (error) {
+    if (error instanceof SearchToolError) {
+      throw error;
+    }
+    if (isAbortError(error)) {
+      throw new SearchToolError("Request aborted.", "aborted", "search-api");
+    }
+    throw new SearchToolError(
+      "Page fetch failed.",
+      "network",
+      "search-api",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+};
+
+export const searchKnowledgeBase = async ({
+  query,
+  signal,
+  onProgress,
+}: {
+  query: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: ToolProgress) => void;
+}): Promise<KnowledgeBaseSearchResponse> => {
+  throwIfAborted(signal);
+
+  const queryTokens = tokenize(query);
+  const queryGrams = buildCounter(buildCharGrams(query));
+  const avgDocLength =
+    knowledgeBaseDocuments.reduce(
+      (total, document) => total + tokenize(`${document.title} ${document.content}`).length,
+      0,
+    ) / Math.max(knowledgeBaseDocuments.length, 1);
+
+  onProgress?.({
+    callId: "",
+    tool: "knowledgeBaseSearch",
+    message: "正在执行混合检索（稀疏 + 密集）",
+    provider: "knowledge-base",
+  });
+
+  let strategy: "hybrid" | "dense-only" = "hybrid";
+  let documents: RetrievalDocument[] = [];
+
+  try {
+    const sparseRanked = knowledgeBaseDocuments
+      .map((document) => {
+        const docTokens = tokenize(`${document.title} ${document.content} ${document.tags.join(" ")}`);
+        const sparseScore = queryTokens.reduce((score, token) => {
+          const tf = docTokens.filter((item) => item === token).length;
+          if (tf === 0) {
+            return score;
+          }
+
+          const df = knowledgeBaseDocuments.filter((candidate) =>
+            tokenize(`${candidate.title} ${candidate.content} ${candidate.tags.join(" ")}`).includes(
+              token,
+            ),
+          ).length;
+          const idf = Math.log(1 + (knowledgeBaseDocuments.length - df + 0.5) / (df + 0.5));
+          const k1 = 1.5;
+          const b = 0.75;
+          return (
+            score +
+            (idf * tf * (k1 + 1)) /
+              (tf + k1 * (1 - b + b * (docTokens.length / Math.max(avgDocLength, 1))))
+          );
+        }, 0);
+
+        const denseScore = cosineFromCounters(
+          queryGrams,
+          buildCounter(buildCharGrams(`${document.title} ${document.content}`)),
+        );
+
+        return { document, sparseScore, denseScore };
+      })
+      .sort((left, right) => right.sparseScore - left.sparseScore);
+
+    const denseRanked = [...sparseRanked].sort((left, right) => right.denseScore - left.denseScore);
+
+    documents = knowledgeBaseDocuments
+      .map((document) => {
+        const sparseRank = sparseRanked.findIndex((entry) => entry.document.id === document.id) + 1;
+        const denseRank = denseRanked.findIndex((entry) => entry.document.id === document.id) + 1;
+        const sparseScore = sparseRanked.find((entry) => entry.document.id === document.id)?.sparseScore ?? 0;
+        const denseScore = denseRanked.find((entry) => entry.document.id === document.id)?.denseScore ?? 0;
+
+        return {
+          id: document.id,
+          title: document.title,
+          source: document.source,
+          url: document.url,
+          content: document.content,
+          metadata: { tags: document.tags },
+          scores: {
+            sparse: sparseScore,
+            dense: denseScore,
+            rrf: reciprocalRankFusion(sparseRank, denseRank),
+            final: reciprocalRankFusion(sparseRank, denseRank),
+          },
+        } satisfies RetrievalDocument;
+      })
+      .sort((left, right) => right.scores.final - left.scores.final)
+      .slice(0, agentEnv.knowledgeBaseMaxResults);
+  } catch {
+    strategy = "dense-only";
+    onProgress?.({
+      callId: "",
+      tool: "knowledgeBaseSearch",
+      message: "混合检索降级为纯密集检索",
+      provider: "knowledge-base",
+    });
+
+    documents = knowledgeBaseDocuments
+      .map((document) => {
+        const denseScore = cosineFromCounters(
+          queryGrams,
+          buildCounter(buildCharGrams(`${document.title} ${document.content}`)),
+        );
+
+        return {
+          id: document.id,
+          title: document.title,
+          source: document.source,
+          url: document.url,
+          content: document.content,
+          metadata: { tags: document.tags },
+          scores: {
+            dense: denseScore,
+            final: denseScore,
+          },
+        } satisfies RetrievalDocument;
+      })
+      .sort((left, right) => right.scores.final - left.scores.final)
+      .slice(0, agentEnv.knowledgeBaseMaxResults);
+  }
+
+  let reranked = false;
+  if (documents.length > 0 && agentEnv.jinaApiKey) {
+    onProgress?.({
+      callId: "",
+      tool: "knowledgeBaseSearch",
+      message: "正在调用 Jina Rerank 精排",
+      provider: "knowledge-base",
+    });
+
+    try {
+      const response = await withTimeout(
+        (innerSignal) =>
+          fetch("https://api.jina.ai/v1/rerank", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${agentEnv.jinaApiKey}`,
+            },
+            body: JSON.stringify({
+              model: agentEnv.jinaRerankModel,
+              query,
+              documents: documents.map((document) => document.content),
+            }),
+            signal: innerSignal,
+          }),
+        agentEnv.webFetchTimeoutMs,
+        signal,
+      );
+
+      if (!response.ok) {
+        throw new Error(`Jina rerank failed with status ${response.status}`);
+      }
+
+      const payload = (await response.json()) as {
+        results?: Array<{ index: number; relevance_score: number }>;
+      };
+
+      const scoreMap = new Map<number, number>();
+      for (const item of payload.results ?? []) {
+        scoreMap.set(item.index, item.relevance_score);
+      }
+
+      documents = documents
+        .map((document, index) => ({
+          ...document,
+          scores: {
+            ...document.scores,
+            rerank: scoreMap.get(index) ?? document.scores.final,
+            final: scoreMap.get(index) ?? document.scores.final,
+          },
+        }))
+        .sort((left, right) => right.scores.final - left.scores.final);
+      reranked = true;
+    } catch {
+      onProgress?.({
+        callId: "",
+        tool: "knowledgeBaseSearch",
+        message: "Jina 精排失败，继续使用本地 hybrid 排序",
+        provider: "knowledge-base",
+      });
+    }
+  }
+
   return {
-    provider,
-    results: processed.results,
-    filteredResults: processed.filteredResults,
+    provider: "knowledge-base",
+    documents,
+    strategy,
+    reranked,
   };
 };
 
-const executeSearchProviderOnce = async (
-  provider: SearchProviderName,
-  query: string,
-) =>
-  withTimeout(
-    async (signal) => {
-      if (provider === "search-api") {
-        return searchApi(query, signal);
-      }
-      if (provider === "duckduckgo-html") {
-        return searchDuckDuckGoHtml(query, signal);
-      }
-      return searchBingRss(query, signal);
-    },
-    agentEnv.webFetchTimeoutMs,
-  );
+export const lookupWeather = async ({
+  location,
+  signal,
+}: {
+  location: string;
+  signal?: AbortSignal;
+}): Promise<WeatherResult> => {
+  throwIfAborted(signal);
 
-const executeSearchProvider = async (
-  provider: SearchProviderName,
-  query: string,
-  attempts: SearchResponse["attempts"],
-) => {
-  let lastError: SearchToolError | null = null;
-
-  for (let attempt = 0; attempt < SEARCH_RETRY_COUNT; attempt += 1) {
-    try {
-      const result = await executeSearchProviderOnce(provider, query);
-      attempts.push({ provider, ok: true });
-      return result;
-    } catch (error) {
-      const searchError = createSearchError(provider, error);
-      attempts.push({
-        provider,
-        ok: false,
-        errorType: searchError.type,
-        detail: searchError.detail ?? searchError.message,
-      });
-      lastError = searchError;
-
-      if (searchError.type === "empty" || searchError.type === "http") {
-        break;
-      }
-
-      if (attempt < SEARCH_RETRY_COUNT - 1) {
-        await sleep(250 * (attempt + 1));
-      }
-    }
-  }
-
-  throw lastError ?? createSearchError(provider, new Error("Unknown provider error"));
-};
-
-export const searchWeb = async (query: string): Promise<SearchResponse> => {
-  const attempts: SearchResponse["attempts"] = [];
-  let lastError: SearchToolError | null = null;
-
-  for (const provider of orderedProviders) {
-    try {
-      const result = await executeSearchProvider(provider, query, attempts);
-      return {
-        ...result,
-        attempts,
-      };
-    } catch (error) {
-      lastError = createSearchError(provider, error);
-    }
-  }
-
-  if (lastError) {
-    throw new SearchToolError(
-      lastError.message,
-      lastError.type,
-      lastError.provider,
-      lastError.userMessage,
-      JSON.stringify(attempts),
-    );
-  }
-
-  throw new SearchToolError(
-    "Search request failed.",
-    "unknown",
-    "search-api",
-    "搜索工具暂时不可用，请稍后再试。",
-  );
-};
-
-export const fetchWebPage = async (url: string): Promise<FetchedPage> => {
   const response = await withTimeout(
-    (signal) =>
-      fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 Agent MVP",
+    (innerSignal) =>
+      fetch(
+        `${agentEnv.weatherApiBaseUrl.replace(/\/$/, "")}/${encodeURIComponent(location)}?format=j1`,
+        {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "Mozilla/5.0 Agent Workspace",
+          },
+          signal: innerSignal,
         },
-        redirect: "follow",
-        signal,
-      }),
+      ),
     agentEnv.webFetchTimeoutMs,
+    signal,
   );
 
   if (!response.ok) {
-    throw new Error(`Page fetch failed with status ${response.status}`);
+    throw new SearchToolError(
+      `Weather lookup failed with status ${response.status}.`,
+      "http",
+      "weather-api",
+      `HTTP ${response.status}`,
+    );
   }
 
-  const html = await response.text();
-  const $ = cheerio.load(html);
+  const payload = (await response.json()) as {
+    current_condition?: Array<{
+      temp_C?: string;
+      FeelsLikeC?: string;
+      humidity?: string;
+      windspeedKmph?: string;
+      weatherDesc?: Array<{ value?: string }>;
+    }>;
+    nearest_area?: Array<{ areaName?: Array<{ value?: string }> }>;
+  };
 
-  $("script, style, noscript, nav, footer, header, aside").remove();
-
-  const title = normalizeWhitespace($("title").first().text()) || url;
-  const description =
-    normalizeWhitespace(
-      $('meta[name="description"]').attr("content") ||
-        $('meta[property="og:description"]').attr("content") ||
-        "",
-    ) || "No description available.";
-  const text = normalizeWhitespace(
-    $("article").text() || $("main").text() || $("body").text(),
-  );
+  const current = payload.current_condition?.[0];
+  const actualLocation = payload.nearest_area?.[0]?.areaName?.[0]?.value ?? location;
 
   return {
-    title,
-    url,
-    description,
-    excerpt: text.slice(0, 1600),
+    location: actualLocation,
+    summary: current?.weatherDesc?.[0]?.value ?? "No weather summary available.",
+    temperatureC: current?.temp_C ? Number(current.temp_C) : null,
+    feelsLikeC: current?.FeelsLikeC ? Number(current.FeelsLikeC) : null,
+    humidity: current?.humidity ? Number(current.humidity) : null,
+    windKph: current?.windspeedKmph ? Number(current.windspeedKmph) : null,
   };
 };

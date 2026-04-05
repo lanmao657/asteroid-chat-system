@@ -4,7 +4,9 @@ import {
   appendSessionMessage,
   clearSessions,
   ensureSession,
+  getSessionMemorySummary,
   listSessionMessages,
+  setSessionMemorySummary,
 } from "./session-store";
 
 describe("session-store", () => {
@@ -34,5 +36,18 @@ describe("session-store", () => {
 
     const secondRead = listSessionMessages("alpha");
     expect(secondRead[0].content).toBe("hello");
+  });
+
+  it("stores memory summary separately from formal messages", () => {
+    setSessionMemorySummary("alpha", "summary text");
+    appendSessionMessage("alpha", {
+      id: "1",
+      role: "assistant",
+      content: "final answer",
+      createdAt: new Date().toISOString(),
+    });
+
+    expect(getSessionMemorySummary("alpha")).toBe("summary text");
+    expect(listSessionMessages("alpha")).toHaveLength(1);
   });
 });

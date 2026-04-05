@@ -1,13 +1,15 @@
-import { z } from "zod";
-
 import { agentEnv } from "@/lib/agent/env";
+import { getPresentationStyleInstruction } from "@/lib/agent/presentation";
 import type {
-  AgentState,
   ChatMessage,
-  FetchedPage,
+  GradeDocumentsInput,
+  GradeDocumentsResult,
   LLMProvider,
-  ProviderDecision,
-  SearchResult,
+  ModelFinishReason,
+  QueryRewriteResult,
+  RewriteQueryInput,
+  StreamAnswerInput,
+  SummarizeConversationInput,
   ToolResult,
 } from "@/lib/agent/types";
 
@@ -22,178 +24,46 @@ class ModelRequestError extends Error {
   }
 }
 
-const decisionSchema = z.object({
-  mode: z.enum(["respond", "search"]),
-  rationale: z.string().min(1),
-  query: z.string().optional(),
-});
+const clip = (value: string, max: number) => {
+  if (value.length <= max) {
+    return value;
+  }
 
-const searchSignals = [
-  "最新",
-  "最近",
-  "今天",
-  "今日",
-  "实时",
-  "新闻",
-  "网页",
-  "搜一下",
-  "查一下",
-  "latest",
-  "recent",
-  "today",
-  "current",
-  "news",
-  "search",
-  "web",
-];
+  return `${value.slice(0, Math.max(0, max - 1))}...`;
+};
 
-const extractJson = (input: string) => {
-  const fenced = input.match(/```json\s*([\s\S]*?)```/i);
+const normalizeWhitespace = (value: string) =>
+  value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const formatConversation = (conversation: ChatMessage[]) =>
+  conversation.map((message) => ({
+    role: message.role,
+    content: clip(normalizeWhitespace(message.content), 800),
+  }));
+
+const formatToolResults = (toolResults: ToolResult[]) =>
+  toolResults.map((result) => ({
+    tool: result.tool,
+    phase: result.phase,
+    status: result.status,
+    summary: result.summary,
+  }));
+
+const average = (numbers: number[]) =>
+  numbers.length === 0
+    ? 0
+    : numbers.reduce((total, value) => total + value, 0) / numbers.length;
+
+const extractJsonObject = (value: string) => {
+  const fenced = value.match(/```json\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
     return fenced[1].trim();
   }
 
-  const objectMatch = input.match(/\{[\s\S]*\}/);
-  return objectMatch?.[0]?.trim() ?? input.trim();
-};
-
-const summarizeSources = (results: SearchResult[], pages: FetchedPage[]) => {
-  const pageSummaries = pages
-    .map(
-      (page, index) =>
-        `${index + 1}. ${page.title} | ${page.url}\n${page.excerpt.slice(0, 240)}`,
-    )
-    .join("\n\n");
-
-  if (pageSummaries) {
-    return pageSummaries;
-  }
-
-  return results
-    .map(
-      (result, index) =>
-        `${index + 1}. ${result.title} | ${result.url}\n${result.snippet}`,
-    )
-    .join("\n\n");
-};
-
-const summarizeToolResults = (toolResults: ToolResult[]) =>
-  toolResults.map((toolResult) => ({
-    tool: toolResult.tool,
-    status: toolResult.status,
-    provider: toolResult.provider,
-    summary: toolResult.summary,
-    errorType: toolResult.errorType,
-    userMessage: toolResult.userMessage,
-    skippedCount: toolResult.skippedCount,
-    filteredCount: toolResult.filteredCount,
-    recoverable: toolResult.recoverable,
-    degradationMode: toolResult.degradationMode,
-    attempts: toolResult.attempts,
-  }));
-
-const getSearchTool = (toolResults: ToolResult[]) =>
-  [...toolResults].reverse().find((entry) => entry.tool === "searchWeb");
-
-const getFetchedCount = (toolResults: ToolResult[]) =>
-  toolResults.filter(
-    (entry) => entry.tool === "fetchWebPage" && entry.status === "success",
-  ).length;
-
-const buildBackgroundAnswer = (userMessage: string) =>
-  [
-    "这次实时检索没有顺利完成，所以我先给你一版基于已有知识整理的背景回答。",
-    `围绕“${userMessage}”，AI agent 近期适合产品演示的重点通常集中在三件事：第一，理解自然语言任务并自动拆解步骤；第二，调用搜索、文档、数据等工具完成执行链路；第三，把执行过程透明展示给用户，方便追踪、确认和人工干预。`,
-    "如果你是做产品 Demo，建议突出“任务拆解、工具调用、结果回收、人工确认”这四个环节，而不是只展示聊天能力。这样更容易让用户理解 agent 和普通问答机器人的差别。",
-    "如果你愿意，我也可以继续把这段背景回答改写成路演口径、官网文案，或者等实时检索恢复后再补一版带来源的最新摘要。",
-  ].join("\n\n");
-
-const createGroundedReply = ({
-  userMessage,
-  searchResults,
-  fetchedCount,
-  searchTool,
-  fallbackMode,
-}: {
-  userMessage: string;
-  searchResults: SearchResult[];
-  fetchedCount: number;
-  searchTool?: ToolResult;
-  fallbackMode: AgentState["fallbackMode"];
-}) => {
-  if (!searchTool) {
-    return "";
-  }
-
-  if (searchTool.status === "error") {
-    return [
-      `我刚刚尝试实时检索“${userMessage}”，但这次搜索没有成功完成。`,
-      searchTool.userMessage || "搜索工具这次请求失败了，我会先继续给你一版背景回答。",
-      buildBackgroundAnswer(userMessage),
-    ].join("\n\n");
-  }
-
-  if (searchTool.status === "empty") {
-    return [
-      `我已经尝试实时检索“${userMessage}”，但这次没有拿到足够相关的结果。`,
-      searchTool.userMessage ||
-        "当前结果相关性不足。你可以换一个更具体的关键词，或补充时间范围和来源偏好。",
-      buildBackgroundAnswer(userMessage),
-    ].join("\n\n");
-  }
-
-  if (fallbackMode === "snippet-only" && searchResults.length > 0 && fetchedCount === 0) {
-    const skipped = searchResults.filter((result) => result.fetchStatus === "skipped").length;
-    return [
-      "以下内容主要依据搜索摘要整理，正文抓取受限或被策略性跳过，因此证据强度弱于直接网页正文。",
-      skipped > 0
-        ? `其中有 ${skipped} 个结果因站点限制被跳过了正文抓取。`
-        : "这批结果的正文抓取没有成功，所以我只能先基于摘要做整理。",
-      "如果你需要更可靠的“最新动态”结论，建议补充更明确的媒体关键词，或指定希望优先参考的来源。",
-    ].join("\n\n");
-  }
-
-  return "";
-};
-
-const createRateLimitReply = ({
-  userMessage,
-  searchResults,
-  pageContents,
-  toolResults,
-  fallbackMode,
-}: {
-  userMessage: string;
-  searchResults: SearchResult[];
-  pageContents: FetchedPage[];
-  toolResults: ToolResult[];
-  fallbackMode: AgentState["fallbackMode"];
-}) => {
-  const groundedPrefix = createGroundedReply({
-    userMessage,
-    searchResults,
-    fetchedCount: getFetchedCount(toolResults),
-    searchTool: getSearchTool(toolResults),
-    fallbackMode,
-  });
-
-  const sourceContext = summarizeSources(searchResults, pageContents);
-
-  if (sourceContext) {
-    return [
-      groundedPrefix,
-      "当前模型请求触发了限流，所以这版回答改为本地降级整理。",
-      "我先把已经拿到的线索归纳给你：",
-      sourceContext,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-  }
-
-  return [
-    "当前模型请求触发了限流（429），所以这轮回答切换到了本地降级模式。",
-    buildBackgroundAnswer(userMessage),
-  ].join("\n\n");
+  const match = value.match(/\{[\s\S]*\}/);
+  return match?.[0]?.trim() ?? value.trim();
 };
 
 class MockLLMProvider implements LLMProvider {
@@ -201,71 +71,79 @@ class MockLLMProvider implements LLMProvider {
 
   readonly label = "Mock Provider";
 
-  async decideNextAction(input: {
-    userMessage: string;
-    conversation: ChatMessage[];
-  }): Promise<ProviderDecision> {
-    const normalized = input.userMessage.toLowerCase();
-    const needsSearch = searchSignals.some((signal) =>
-      normalized.includes(signal.toLowerCase()),
-    );
+  async summarizeConversation(input: SummarizeConversationInput) {
+    const lines = input.messagesToSummarize
+      .slice(-8)
+      .map((message) => `${message.role}: ${clip(normalizeWhitespace(message.content), 80)}`);
 
-    if (needsSearch) {
+    return [
+      input.existingSummary ? `已有摘要：${clip(input.existingSummary, 120)}` : "",
+      "历史对话摘要：",
+      ...lines,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  async rewriteQuery(input: RewriteQueryInput): Promise<QueryRewriteResult> {
+    const mode = input.strategyHint ?? "step-back";
+    if (mode === "hyde") {
       return {
-        mode: "search",
-        rationale: "The request looks time-sensitive or web-dependent.",
-        query: input.userMessage.trim(),
+        mode,
+        query: `${input.userMessage} 关键事实 参考资料`,
+        reason: "使用 HyDE 风格扩展查询，补充更容易命中的语义线索。",
       };
     }
 
     return {
-      mode: "respond",
-      rationale: "The request can be handled directly without external tools.",
+      mode,
+      query: `${input.userMessage} 核心概念 背景 原理`,
+      reason: "使用 Step-Back 风格重写，把问题提升到更稳定的抽象层。",
     };
   }
 
-  async composeAnswer(input: {
-    userMessage: string;
-    conversation: ChatMessage[];
-    searchResults: SearchResult[];
-    pageContents: FetchedPage[];
-    toolResults: ToolResult[];
-    fallbackMode: AgentState["fallbackMode"];
-  }) {
-    const searchTool = getSearchTool(input.toolResults);
-    const fetchedCount = getFetchedCount(input.toolResults);
-    const groundedPrefix = createGroundedReply({
-      userMessage: input.userMessage,
-      searchResults: input.searchResults,
-      fetchedCount,
-      searchTool,
-      fallbackMode: input.fallbackMode,
-    });
+  async gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult> {
+    const scores = input.retrievalContext.map((document) => document.scores.final);
+    const averageScore = average(scores);
+    return averageScore >= 0.55
+      ? {
+          decision: "answer",
+          averageScore,
+          reason: "候选文档相关性足够，可以直接回答。",
+        }
+      : {
+          decision: "rewrite",
+          averageScore,
+          reason: "候选文档相关性偏弱，建议触发查询重写。",
+        };
+  }
 
-    if (groundedPrefix) {
-      return groundedPrefix;
-    }
-
-    const historyHint = input.conversation
-      .slice(-3)
-      .map((message) => `${message.role}: ${message.content}`)
-      .join("\n");
-
-    if (!input.searchResults.length && !input.pageContents.length) {
-      return [
-        "这是一个本地可运行的 Agent MVP 回复。",
-        `我理解你的问题是：${input.userMessage}`,
-        historyHint ? `最近上下文：\n${historyHint}` : "",
-        "当前没有调用外部网页工具，所以这段回复来自内置 mock provider。配置好模型和搜索 API 后，它会自动切换到真实检索和真实模型能力。",
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-    }
-
-    const sources = summarizeSources(input.searchResults, input.pageContents);
-    return [groundedPrefix, `我围绕“${input.userMessage}”整理到了这些可用线索：`, sources]
+  async streamAnswer(input: StreamAnswerInput) {
+    const text = [
+      "这是 mock provider 的流式回答。",
+      input.memorySummary ? `记忆摘要：${clip(input.memorySummary, 120)}` : "",
+      input.retrievalDocuments.length > 0
+        ? `检索到 ${input.retrievalDocuments.length} 条候选来源，并完成可观测处理。`
+        : input.searchResults.length > 0
+          ? `网页搜索命中 ${input.searchResults.length} 条结果，抓取了 ${input.pageContents.length} 个正文来源。`
+          : "这轮没有触发外部检索。",
+      `当前问题：${clip(normalizeWhitespace(input.userMessage), 160)}`,
+    ]
       .filter(Boolean)
       .join("\n\n");
+
+    let built = "";
+    for (const part of text.match(/[\s\S]{1,18}/g) ?? [text]) {
+      input.signal?.throwIfAborted?.();
+      await sleep(10);
+      built += part;
+      await input.onDelta(part);
+    }
+
+    return {
+      text: built,
+      finishReason: "stop" as const,
+    };
   }
 }
 
@@ -280,19 +158,47 @@ class OpenAICompatibleProvider implements LLMProvider {
     private readonly model: string,
   ) {}
 
-  async decideNextAction(input: {
-    userMessage: string;
-    conversation: ChatMessage[];
-  }): Promise<ProviderDecision> {
-    try {
-      const content = await this.generateText([
+  async summarizeConversation(input: SummarizeConversationInput) {
+    return this.generateText(
+      [
         {
           role: "system",
           content: [
-            "You are a routing model for an agent.",
-            "Choose whether the assistant should answer directly or search the web first.",
-            "Return only JSON with keys: mode, rationale, query.",
-            "Use mode=search only when freshness or web lookup is necessary.",
+            "Summarize older chat history for a future assistant turn.",
+            "Keep user goals, constraints, decisions, unresolved questions, and promised follow-ups.",
+            "Do not invent facts.",
+            "Return plain text under 220 words.",
+          ].join(" "),
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              existingSummary: input.existingSummary,
+              messages: formatConversation(input.messagesToSummarize),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      input.signal,
+      260,
+    );
+  }
+
+  async rewriteQuery(input: RewriteQueryInput): Promise<QueryRewriteResult> {
+    const strategyHint = input.strategyHint ?? "step-back";
+    const text = await this.generateText(
+      [
+        {
+          role: "system",
+          content: [
+            "You rewrite retrieval queries for a RAG system.",
+            "Return JSON with keys: mode, query, reason.",
+            "mode must be one of none, step-back, hyde.",
+            "Use step-back to generalize the intent.",
+            "Use hyde to create a richer pseudo-answer-style retrieval query.",
           ].join(" "),
         },
         {
@@ -300,117 +206,270 @@ class OpenAICompatibleProvider implements LLMProvider {
           content: JSON.stringify(
             {
               userMessage: input.userMessage,
-              conversation: input.conversation.slice(-6),
+              strategyHint,
+              retrievalContext: input.retrievalContext.slice(0, 4).map((document) => ({
+                title: document.title,
+                source: document.source,
+                score: document.scores.final,
+              })),
             },
             null,
             2,
           ),
         },
-      ]);
+      ],
+      input.signal,
+      180,
+    );
 
-      const parsed = decisionSchema.safeParse(JSON.parse(extractJson(content)));
-      if (parsed.success) {
-        return parsed.data;
+    try {
+      const parsed = JSON.parse(extractJsonObject(text)) as QueryRewriteResult;
+      if (parsed.mode && parsed.query && parsed.reason) {
+        return parsed;
       }
-    } catch (error) {
-      if (!(error instanceof ModelRequestError) || error.status !== 429) {
-        throw error;
+    } catch {}
+
+    return strategyHint === "hyde"
+      ? {
+          mode: "hyde",
+          query: `${input.userMessage} facts examples explanation`,
+          reason: "Fallback HyDE rewrite applied.",
+        }
+      : {
+          mode: "step-back",
+          query: `${input.userMessage} overview background fundamentals`,
+          reason: "Fallback Step-Back rewrite applied.",
+        };
+  }
+
+  async gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult> {
+    const text = await this.generateText(
+      [
+        {
+          role: "system",
+          content: [
+            "You grade retrieval relevance for a RAG system.",
+            "Return JSON with keys: decision, averageScore, reason.",
+            "decision must be answer or rewrite.",
+            "averageScore must be a number between 0 and 1.",
+          ].join(" "),
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              userMessage: input.userMessage,
+              retrievalContext: input.retrievalContext.slice(0, 5).map((document) => ({
+                title: document.title,
+                source: document.source,
+                content: clip(document.content, 260),
+                score: document.scores.final,
+              })),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      input.signal,
+      160,
+    );
+
+    try {
+      const parsed = JSON.parse(extractJsonObject(text)) as GradeDocumentsResult;
+      if (
+        (parsed.decision === "answer" || parsed.decision === "rewrite") &&
+        Number.isFinite(parsed.averageScore) &&
+        parsed.reason
+      ) {
+        return parsed;
+      }
+    } catch {}
+
+    const fallbackAverage = average(input.retrievalContext.map((document) => document.scores.final));
+    return fallbackAverage >= 0.55
+      ? {
+          decision: "answer",
+          averageScore: fallbackAverage,
+          reason: "Fallback relevance grade passed.",
+        }
+      : {
+          decision: "rewrite",
+          averageScore: fallbackAverage,
+          reason: "Fallback relevance grade requested rewrite.",
+        };
+  }
+
+  async streamAnswer(input: StreamAnswerInput) {
+    const response = await fetch(
+      `${this.baseUrl.replace(/\/$/, "")}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          temperature: 0.2,
+          max_tokens: agentEnv.composeOutputTokenLimit,
+          stream: true,
+          messages: this.buildAnswerMessages(input),
+        }),
+        signal: input.signal,
+      },
+    );
+
+    if (!response.ok || !response.body) {
+      let detail = "";
+      try {
+        detail = await response.text();
+      } catch {
+        detail = "";
+      }
+
+      throw new ModelRequestError(
+        `Model request failed with status ${response.status}`,
+        response.status,
+        detail,
+      );
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let built = "";
+    let finishReason: ModelFinishReason = "unknown";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const parsed = this.parseStreamFrame(frame);
+        if (parsed.finishReason) {
+          finishReason = parsed.finishReason;
+        }
+
+        if (!parsed.delta) {
+          continue;
+        }
+
+        built += parsed.delta;
+        await input.onDelta(parsed.delta);
       }
     }
 
-    const normalized = input.userMessage.toLowerCase();
-    const needsSearch = searchSignals.some((signal) =>
-      normalized.includes(signal.toLowerCase()),
-    );
+    const finalText = built.trim();
+    if (!finalText) {
+      throw new ModelRequestError("Model response did not contain content.", 200);
+    }
 
     return {
-      mode: needsSearch ? "search" : "respond",
-      rationale: "Fallback to local routing because the model request was rate-limited.",
-      query: needsSearch ? input.userMessage.trim() : undefined,
+      text: finalText,
+      finishReason,
     };
   }
 
-  async composeAnswer(input: {
-    userMessage: string;
-    conversation: ChatMessage[];
-    searchResults: SearchResult[];
-    pageContents: FetchedPage[];
-    toolResults: ToolResult[];
-    fallbackMode: AgentState["fallbackMode"];
-  }) {
-    const searchTool = getSearchTool(input.toolResults);
-    const fetchedCount = getFetchedCount(input.toolResults);
-    const groundedPrefix = createGroundedReply({
-      userMessage: input.userMessage,
-      searchResults: input.searchResults,
-      fetchedCount,
-      searchTool,
-      fallbackMode: input.fallbackMode,
-    });
+  private buildAnswerMessages(input: StreamAnswerInput) {
+    const presentationStyleInstruction = getPresentationStyleInstruction(
+      input.userMessage,
+    );
 
-    if (
-      groundedPrefix &&
-      (searchTool?.status === "error" || searchTool?.status === "empty")
-    ) {
-      return groundedPrefix;
+    return [
+      {
+        role: "system" as const,
+        content: [
+          "You are a helpful assistant inside a chat application.",
+          "Answer in the same language as the user unless there is a strong reason not to.",
+          "Use memory summary and recent conversation when helpful.",
+          "Ground the answer in the highest quality retrieval evidence available.",
+          "When evidence is weak, explicitly say uncertainty is high.",
+          "If structured presentation is appropriate, prefer clean Markdown headings and lists.",
+          "Do not mention internal implementation details unless the user asks.",
+          presentationStyleInstruction,
+        ].join(" "),
+      },
+      {
+        role: "user" as const,
+        content: JSON.stringify(
+          {
+            userMessage: clip(normalizeWhitespace(input.userMessage), 1_600),
+            memorySummary: input.memorySummary,
+            recentConversation: formatConversation(input.recentConversation),
+            retrievalDocuments: input.retrievalDocuments.slice(0, 6).map((document) => ({
+              title: document.title,
+              source: document.source,
+              url: document.url,
+              content: clip(document.content, 420),
+              scores: document.scores,
+            })),
+            searchResults: input.searchResults.slice(0, 4),
+            pageContents: input.pageContents.slice(0, 3),
+            toolResults: formatToolResults(input.toolResults),
+          },
+          null,
+          2,
+        ),
+      },
+    ];
+  }
+
+  private parseStreamFrame(frame: string): {
+    delta: string;
+    finishReason: ModelFinishReason | null;
+  } {
+    const dataLines = frame
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice(6).trim());
+
+    if (dataLines.length === 0) {
+      return { delta: "", finishReason: null };
     }
 
-    const sourceContext = summarizeSources(input.searchResults, input.pageContents);
-
-    try {
-      return await this.generateText([
-        {
-          role: "system",
-          content: [
-            "You are a helpful assistant inside a web agent product.",
-            "Be conservative and evidence-aware.",
-            "Always explain the real-time retrieval status first when tools were attempted.",
-            "Treat fetched page content as stronger evidence than search snippets.",
-            "If only search snippets are available, explicitly say the answer is mainly based on search snippets and that page capture was limited or skipped.",
-            "If real-time search failed, clearly state that limitation and then provide a useful background answer.",
-            "Do not present community or forum snippets as confirmed news facts.",
-            "If the result quality looks weak, say authoritative coverage is insufficient.",
-            "Do not claim that you cannot access the internet unless the tool summary explicitly says the environment is offline.",
-            "Avoid repetitive failure wording. Keep the limitation notice brief, then answer the user.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
-            {
-              userMessage: input.userMessage,
-              recentConversation: input.conversation.slice(-6),
-              fetchedPageCount: fetchedCount,
-              snippetOnlyCount: input.searchResults.filter(
-                (result) => result.fetchStatus !== "fetched",
-              ).length,
-              fallbackMode: input.fallbackMode,
-              groundingPrefix: groundedPrefix,
-              sources: sourceContext,
-              toolResults: summarizeToolResults(input.toolResults),
-            },
-            null,
-            2,
-          ),
-        },
-      ]);
-    } catch (error) {
-      if (error instanceof ModelRequestError && error.status === 429) {
-        return createRateLimitReply({
-          userMessage: input.userMessage,
-          searchResults: input.searchResults,
-          pageContents: input.pageContents,
-          toolResults: input.toolResults,
-          fallbackMode: input.fallbackMode,
-        });
-      }
-
-      throw error;
+    const payload = dataLines.join("\n");
+    if (payload === "[DONE]") {
+      return { delta: "", finishReason: null };
     }
+
+    const parsed = JSON.parse(payload) as {
+      choices?: Array<{
+        delta?: {
+          content?: string | Array<{ type?: string; text?: string }>;
+        };
+        finish_reason?: string | null;
+      }>;
+    };
+
+    const finishReason = this.normalizeFinishReason(parsed.choices?.[0]?.finish_reason);
+    const content = parsed.choices?.[0]?.delta?.content;
+    if (typeof content === "string") {
+      return { delta: content, finishReason };
+    }
+
+    if (Array.isArray(content)) {
+      return {
+        delta: content
+          .map((item) => (item.type === "text" ? item.text ?? "" : ""))
+          .join(""),
+        finishReason,
+      };
+    }
+
+    return { delta: "", finishReason };
   }
 
   private async generateText(
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+    signal?: AbortSignal,
+    maxTokens = agentEnv.composeOutputTokenLimit,
   ) {
     const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
@@ -421,8 +480,10 @@ class OpenAICompatibleProvider implements LLMProvider {
       body: JSON.stringify({
         model: this.model,
         temperature: 0.2,
+        max_tokens: maxTokens,
         messages,
       }),
+      signal,
     });
 
     if (!response.ok) {
@@ -432,6 +493,7 @@ class OpenAICompatibleProvider implements LLMProvider {
       } catch {
         detail = "";
       }
+
       throw new ModelRequestError(
         `Model request failed with status ${response.status}`,
         response.status,
@@ -440,30 +502,55 @@ class OpenAICompatibleProvider implements LLMProvider {
     }
 
     const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | null } }>;
+      choices?: Array<{
+        message?: { content?: string | null };
+        finish_reason?: string | null;
+      }>;
     };
 
-    const content = payload.choices?.[0]?.message?.content;
+    const content = payload.choices?.[0]?.message?.content?.trim();
     if (!content) {
-      throw new Error("Model response did not contain content.");
+      throw new ModelRequestError("Model response did not contain content.", 200);
     }
 
     return content;
   }
+
+  private normalizeFinishReason(value: string | null | undefined): ModelFinishReason | null {
+    if (!value) {
+      return null;
+    }
+    if (
+      value === "stop" ||
+      value === "length" ||
+      value === "abort" ||
+      value === "error"
+    ) {
+      return value;
+    }
+
+    return "unknown";
+  }
 }
 
-export const createProvider = (): LLMProvider => {
-  if (
-    agentEnv.modelProvider !== "mock" &&
-    agentEnv.openAiCompatApiKey &&
-    agentEnv.openAiModel
-  ) {
-    return new OpenAICompatibleProvider(
-      agentEnv.openAiCompatBaseUrl,
-      agentEnv.openAiCompatApiKey,
-      agentEnv.openAiModel,
+const createOpenAiProvider = () => {
+  if (!agentEnv.openAiCompatApiKey || !agentEnv.openAiModel) {
+    throw new Error(
+      "OpenAI-compatible API is not configured. Please set OPENAI_COMPAT_API_KEY and OPENAI_MODEL.",
     );
   }
 
-  return new MockLLMProvider();
+  return new OpenAICompatibleProvider(
+    agentEnv.openAiCompatBaseUrl,
+    agentEnv.openAiCompatApiKey,
+    agentEnv.openAiModel,
+  );
+};
+
+export const createProvider = (): LLMProvider => {
+  if (agentEnv.modelProvider === "mock") {
+    return new MockLLMProvider();
+  }
+
+  return createOpenAiProvider();
 };

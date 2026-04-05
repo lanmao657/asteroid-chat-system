@@ -1,8 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runAgentTurn } from "./runtime";
-import { SearchToolError } from "./tools";
-import type { AgentStreamEvent, LLMProvider, SearchResult } from "./types";
+import type { AgentStreamEvent, LLMProvider, RetrievalDocument } from "./types";
 
 const collectEvents = () => {
   const events: AgentStreamEvent[] = [];
@@ -14,190 +13,307 @@ const collectEvents = () => {
   };
 };
 
-const rankedSearchResult: SearchResult = {
-  title: "Reuters AI Agent News",
-  url: "https://www.reuters.com/tech/ai-agent",
-  snippet: "Latest AI agent news snippet",
-  domain: "reuters.com",
-  evidence: "search-snippet",
-  fetchStatus: "pending",
-  rankingSignals: ["trusted-news-domain"],
-};
+const createRetrievalDocument = (final = 0.72): RetrievalDocument => ({
+  id: "doc-1",
+  title: "Doc 1",
+  source: "knowledge-base",
+  content: "retrieval content",
+  scores: { final },
+});
+
+const createProvider = (): LLMProvider => ({
+  id: "test-provider",
+  label: "Test Provider",
+  summarizeConversation: vi.fn(async ({ messagesToSummarize }) => {
+    return `summary:${messagesToSummarize.length}`;
+  }),
+  rewriteQuery: vi.fn(async ({ strategyHint, userMessage }) => ({
+    mode: strategyHint ?? "step-back",
+    query: `${userMessage} rewritten`,
+    reason: "rewrite requested",
+  })),
+  gradeDocuments: vi.fn(async ({ retrievalContext }) => ({
+    decision:
+      retrievalContext.length > 0 && retrievalContext[0].scores.final > 0.55
+        ? ("answer" as const)
+        : ("rewrite" as const),
+    averageScore: retrievalContext.length > 0 ? retrievalContext[0].scores.final : 0,
+    reason: "graded",
+  })),
+  streamAnswer: vi.fn(async ({ onDelta }) => {
+    await onDelta("hello ");
+    await onDelta("world");
+    return {
+      text: "hello world",
+      finishReason: "stop" as const,
+    };
+  }),
+});
 
 describe("runAgentTurn", () => {
-  it("responds directly when the provider skips tools", async () => {
-    const provider: LLMProvider = {
-      id: "test-direct",
-      label: "Test Direct",
-      async decideNextAction() {
-        return { mode: "respond", rationale: "No tool required." };
-      },
-      async composeAnswer() {
-        return "Direct answer";
-      },
-    };
+  afterEach(() => {
+    delete process.env.AGENT_MAX_CONTINUATIONS;
+    delete process.env.AGENT_CONTINUATION_TAIL_CHARS;
+    vi.resetModules();
+  });
 
+  it("compacts old messages and streams the assistant answer", async () => {
+    const provider = createProvider();
     const { events, emit } = collectEvents();
+
     const result = await runAgentTurn({
       sessionId: "session-1",
+      userMessage: "continue",
+      conversation: Array.from({ length: 9 }, (_, index) => ({
+        id: `m${index + 1}`,
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `message-${index + 1}`,
+        createdAt: new Date().toISOString(),
+      })),
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.memorySummary).toBe("summary:5");
+    expect(provider.summarizeConversation).toHaveBeenCalledTimes(1);
+    expect(provider.streamAnswer).toHaveBeenCalledTimes(1);
+    expect(events.map((event) => event.type)).toEqual([
+      "run_started",
+      "session",
+      "memory_compacted",
+      "tool_started",
+      "tool_progress",
+      "assistant_started",
+      "assistant_delta",
+      "assistant_delta",
+    ]);
+  });
+
+  it("runs observable knowledge-base retrieval with grading", async () => {
+    const provider = createProvider();
+    const searchKnowledgeBase = vi.fn(async ({ onProgress }) => {
+      onProgress?.({
+        callId: "",
+        tool: "knowledgeBaseSearch",
+        message: "hybrid search",
+      });
+      return {
+        provider: "knowledge-base" as const,
+        strategy: "hybrid" as const,
+        reranked: false,
+        documents: [createRetrievalDocument()],
+      };
+    });
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-2",
+      userMessage: "请从知识库里找一下 agent workspace 的设计说明",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        searchKnowledgeBase,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(searchKnowledgeBase).toHaveBeenCalledTimes(1);
+    expect(provider.gradeDocuments).toHaveBeenCalledTimes(1);
+    expect(events.map((event) => event.type)).toContain("tool_started");
+    expect(events.map((event) => event.type)).toContain("tool_progress");
+    expect(events.map((event) => event.type)).toContain("tool_result");
+  });
+
+  it("returns aborted state when the signal aborts during generation", async () => {
+    const controller = new AbortController();
+    const provider: LLMProvider = {
+      id: "test-provider",
+      label: "Test Provider",
+      summarizeConversation: vi.fn(async () => ""),
+      rewriteQuery: vi.fn(async () => ({
+        mode: "step-back" as const,
+        query: "rewritten",
+        reason: "reason",
+      })),
+      gradeDocuments: vi.fn(async () => ({
+        decision: "answer" as const,
+        averageScore: 0.8,
+        reason: "good enough",
+      })),
+      streamAnswer: vi.fn(async ({ onDelta, signal }) => {
+        await onDelta("partial");
+        controller.abort();
+        signal?.throwIfAborted?.();
+        return {
+          text: "partial",
+          finishReason: "abort" as const,
+        };
+      }),
+    };
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-3",
       userMessage: "hello",
       conversation: [],
+      memorySummary: "",
+      emit,
+      signal: controller.signal,
+      dependencies: { provider },
+    });
+
+    expect(result.status).toBe("aborted");
+    expect(result.assistantText).toBe("partial");
+    expect(events.some((event) => event.type === "assistant_aborted")).toBe(true);
+  });
+
+  it("keeps the streamed delta aggregation even if the provider returns a shorter final string", async () => {
+    const provider: LLMProvider = {
+      id: "test-provider",
+      label: "Test Provider",
+      summarizeConversation: vi.fn(async () => ""),
+      rewriteQuery: vi.fn(async () => ({
+        mode: "step-back" as const,
+        query: "rewritten",
+        reason: "reason",
+      })),
+      gradeDocuments: vi.fn(async () => ({
+        decision: "answer" as const,
+        averageScore: 0.9,
+        reason: "good enough",
+      })),
+      streamAnswer: vi.fn(async ({ onDelta }) => {
+        await onDelta("this is a much longer streamed answer");
+        return {
+          text: "short",
+          finishReason: "stop" as const,
+        };
+      }),
+    };
+
+    const result = await runAgentTurn({
+      sessionId: "session-4",
+      userMessage: "hello",
+      conversation: [],
+      memorySummary: "",
+      emit: () => {},
+      dependencies: { provider },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.assistantText).toBe("this is a much longer streamed answer");
+  });
+
+  it("continues generation when the first pass ends because of the output limit", async () => {
+    const provider: LLMProvider = {
+      id: "test-provider",
+      label: "Test Provider",
+      summarizeConversation: vi.fn(async () => ""),
+      rewriteQuery: vi.fn(async () => ({
+        mode: "step-back" as const,
+        query: "rewritten",
+        reason: "reason",
+      })),
+      gradeDocuments: vi.fn(async () => ({
+        decision: "answer" as const,
+        averageScore: 0.9,
+        reason: "good enough",
+      })),
+      streamAnswer: vi
+        .fn()
+        .mockImplementationOnce(async ({ onDelta }) => {
+          await onDelta("Step 1\n");
+          return {
+            text: "Step 1",
+            finishReason: "length" as const,
+          };
+        })
+        .mockImplementationOnce(async ({ onDelta, userMessage }) => {
+          expect(userMessage).toContain("Continuation 2");
+          expect(userMessage).toContain("Step 1");
+          await onDelta("Step 2");
+          return {
+            text: "Step 2",
+            finishReason: "stop" as const,
+          };
+        }),
+    };
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-5",
+      userMessage: "give me a long outline",
+      conversation: [],
+      memorySummary: "",
       emit,
       dependencies: { provider },
     });
 
-    expect(result.assistantText).toBe("Direct answer");
-    expect(events.some((event) => event.type === "tool_started")).toBe(false);
-  });
-
-  it("executes search and page fetch when the provider requests web tools", async () => {
-    const provider: LLMProvider = {
-      id: "test-search",
-      label: "Test Search",
-      async decideNextAction() {
-        return {
-          mode: "search",
-          rationale: "Need fresh info.",
-          query: "latest ai agent news",
-        };
-      },
-      async composeAnswer(input) {
-        return `Sources: ${input.pageContents.length} / tools: ${input.toolResults.length} / fallback:${input.fallbackMode}`;
-      },
-    };
-
-    const { events, emit } = collectEvents();
-    const result = await runAgentTurn({
-      sessionId: "session-2",
-      userMessage: "latest ai agent news",
-      conversation: [],
-      emit,
-      dependencies: {
-        provider,
-        search: async () => ({
-          provider: "search-api",
-          results: [rankedSearchResult],
-          filteredResults: [],
-          attempts: [{ provider: "search-api", ok: true }],
-        }),
-        fetchPage: async (url) => ({
-          title: "Fetched",
-          url,
-          description: "Description",
-          excerpt: "Excerpt",
-        }),
-      },
-    });
-
-    expect(result.searchResults).toHaveLength(1);
-    expect(result.pageContents).toHaveLength(1);
-    expect(result.assistantText).toContain("Sources: 1");
-    expect(result.assistantText).toContain("fallback:none");
-    expect(events.some((event) => event.type === "assistant_delta")).toBe(true);
-  });
-
-  it("continues to compose an answer when search fails", async () => {
-    const provider: LLMProvider = {
-      id: "test-failure",
-      label: "Test Failure",
-      async decideNextAction() {
-        return {
-          mode: "search",
-          rationale: "Need fresh info.",
-          query: "today headlines",
-        };
-      },
-      async composeAnswer(input) {
-        return `继续回答:${input.fallbackMode}`;
-      },
-    };
-
-    const { events, emit } = collectEvents();
-    const result = await runAgentTurn({
-      sessionId: "session-3",
-      userMessage: "today headlines",
-      conversation: [],
-      emit,
-      dependencies: {
-        provider,
-        search: async () => {
-          throw new SearchToolError(
-            "Search request failed for duckduckgo-html.",
-            "network",
-            "duckduckgo-html",
-            "搜索工具请求失败了，请稍后重试。",
-            "fetch failed",
-          );
-        },
-      },
-    });
-
-    expect(result.searchResults).toHaveLength(0);
-    expect(result.assistantText).toContain("继续回答:background");
-    expect(events.some((event) => event.type === "tool_result")).toBe(true);
-    expect(events.some((event) => event.type === "assistant_started")).toBe(true);
-    expect(events.some((event) => event.type === "assistant_delta")).toBe(true);
-  });
-
-  it("does not fetch blocked or skipped results", async () => {
-    const provider: LLMProvider = {
-      id: "test-skipped",
-      label: "Test Skipped",
-      async decideNextAction() {
-        return {
-          mode: "search",
-          rationale: "Need fresh info.",
-          query: "AI agent 最新新闻",
-        };
-      },
-      async composeAnswer(input) {
-        const skipped = input.toolResults.filter((entry) => entry.status === "skipped");
-        return `skipped:${skipped.length} mode:${input.fallbackMode}`;
-      },
-    };
-
-    let fetchCount = 0;
-
-    const { events, emit } = collectEvents();
-    const result = await runAgentTurn({
-      sessionId: "session-4",
-      userMessage: "AI agent 最新新闻",
-      conversation: [],
-      emit,
-      dependencies: {
-        provider,
-        search: async () => ({
-          provider: "bing-rss",
-          results: [
-            {
-              ...rankedSearchResult,
-              domain: "restricted.example.com",
-              fetchStatus: "skipped",
-              skipReason: "blocked-domain",
-            },
-          ],
-          filteredResults: [],
-          attempts: [{ provider: "bing-rss", ok: true }],
-        }),
-        fetchPage: async (url) => {
-          fetchCount += 1;
-          return {
-            title: "Fetched",
-            url,
-            description: "Description",
-            excerpt: "Excerpt",
-          };
-        },
-      },
-    });
-
-    expect(fetchCount).toBe(0);
-    expect(result.assistantText).toContain("skipped:1");
-    expect(result.assistantText).toContain("mode:snippet-only");
+    expect(result.status).toBe("completed");
+    expect(result.assistantText).toBe("Step 1\nStep 2");
+    expect(provider.streamAnswer).toHaveBeenCalledTimes(2);
     expect(
       events.some(
-        (event) => event.type === "tool_started" && event.toolCall.tool === "fetchWebPage",
+        (event) =>
+          event.type === "tool_progress" &&
+          event.progress.message.includes("Continuing answer"),
       ),
-    ).toBe(false);
+    ).toBe(true);
+  });
+
+  it("stops continuing after the configured continuation cap", async () => {
+    process.env.AGENT_MAX_CONTINUATIONS = "1";
+    vi.resetModules();
+
+    const { runAgentTurn: runAgentTurnWithEnv } = await import("./runtime");
+    const provider: LLMProvider = {
+      id: "test-provider",
+      label: "Test Provider",
+      summarizeConversation: vi.fn(async () => ""),
+      rewriteQuery: vi.fn(async () => ({
+        mode: "step-back" as const,
+        query: "rewritten",
+        reason: "reason",
+      })),
+      gradeDocuments: vi.fn(async () => ({
+        decision: "answer" as const,
+        averageScore: 0.9,
+        reason: "good enough",
+      })),
+      streamAnswer: vi.fn(async ({ onDelta }) => {
+        await onDelta("more ");
+        return {
+          text: "more ",
+          finishReason: "length" as const,
+        };
+      }),
+    };
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurnWithEnv({
+      sessionId: "session-6",
+      userMessage: "give me a very long outline",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: { provider },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(provider.streamAnswer).toHaveBeenCalledTimes(2);
+    expect(result.assistantText).toBe("more more ");
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_progress" &&
+          event.progress.message === "Continuing -> limit reached",
+      ),
+    ).toBe(true);
   });
 });

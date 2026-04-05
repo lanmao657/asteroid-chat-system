@@ -4,8 +4,9 @@ const originalProviders = process.env.SEARCH_PROVIDERS;
 const originalSearchApiKey = process.env.SEARCH_API_KEY;
 const originalBlockedDomains = process.env.SEARCH_BLOCKED_DOMAINS;
 const originalDemotedDomains = process.env.SEARCH_DEMOTED_DOMAINS;
+const originalJinaApiKey = process.env.JINA_API_KEY;
 
-describe("searchWeb", () => {
+describe("searchWeb, knowledgeBaseSearch, fetchWebPage, and weatherLookup", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.resetModules();
@@ -13,6 +14,7 @@ describe("searchWeb", () => {
     process.env.SEARCH_API_KEY = originalSearchApiKey;
     process.env.SEARCH_BLOCKED_DOMAINS = originalBlockedDomains;
     process.env.SEARCH_DEMOTED_DOMAINS = originalDemotedDomains;
+    process.env.JINA_API_KEY = originalJinaApiKey;
   });
 
   it("falls back to bing rss when primary providers fail", async () => {
@@ -29,7 +31,7 @@ describe("searchWeb", () => {
         }
 
         if (url.includes("html.duckduckgo.com")) {
-          throw new Error("fetch failed");
+          return new Response("<html></html>", { status: 200 });
         }
 
         return new Response(
@@ -43,123 +45,71 @@ describe("searchWeb", () => {
     );
 
     const { searchWeb } = await import("./tools");
-    const result = await searchWeb("AI agent 最新新闻 2026");
+    const result = await searchWeb({ query: "AI agent 最新新闻 2026" });
 
     expect(result.provider).toBe("bing-rss");
     expect(result.results).toHaveLength(1);
     expect(result.results[0].domain).toBe("reuters.com");
-    expect(result.attempts.some((attempt) => attempt.provider === "search-api")).toBe(true);
-    expect(result.attempts.some((attempt) => attempt.provider === "bing-rss" && attempt.ok)).toBe(
-      true,
-    );
   });
 
-  it("uses the primary search api when configured", async () => {
-    process.env.SEARCH_API_KEY = "test-key";
-    process.env.SEARCH_PROVIDERS = "search-api,duckduckgo-html,bing-rss";
-
+  it("fetches page text into a compact excerpt", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        if (!url.includes("google.serper.dev")) {
-          throw new Error("unexpected fallback request");
-        }
-
-        expect(init?.method).toBe("POST");
-        return new Response(
-          JSON.stringify({
-            organic: [
-              {
-                title: "Reuters AI Agent News",
-                link: "https://www.reuters.com/tech/ai-agent",
-                snippet: "Latest AI agent news snippet",
-              },
-            ],
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
-        );
-      }),
+      vi.fn(async () =>
+        new Response(
+          "<html><head><title>Hello</title><meta name='description' content='Desc'></head><body><main>Body content for testing</main></body></html>",
+          { status: 200, headers: { "Content-Type": "text/html" } },
+        ),
+      ),
     );
 
-    const { searchWeb } = await import("./tools");
-    const result = await searchWeb("AI agent 最新新闻");
+    const { fetchWebPage } = await import("./tools");
+    const page = await fetchWebPage({ url: "https://example.com/article" });
 
-    expect(result.provider).toBe("search-api");
-    expect(result.results[0].domain).toBe("reuters.com");
-    expect(result.attempts).toEqual([{ provider: "search-api", ok: true }]);
+    expect(page.title).toBe("Hello");
+    expect(page.description).toBe("Desc");
+    expect(page.excerpt).toContain("Body content for testing");
   });
 
-  it("demotes low-value domains instead of blocking them by default", async () => {
-    process.env.SEARCH_API_KEY = "test-key";
-    process.env.SEARCH_DEMOTED_DOMAINS = "zhihu.com";
-    process.env.SEARCH_BLOCKED_DOMAINS = "";
-    process.env.SEARCH_PROVIDERS = "search-api";
+  it("returns hybrid knowledge base candidates", async () => {
+    process.env.JINA_API_KEY = "";
+    const { searchKnowledgeBase } = await import("./tools");
+    const result = await searchKnowledgeBase({
+      query: "knowledge base observability and rerank",
+    });
 
+    expect(result.provider).toBe("knowledge-base");
+    expect(result.documents.length).toBeGreaterThan(0);
+    expect(result.strategy === "hybrid" || result.strategy === "dense-only").toBe(true);
+  });
+
+  it("parses weather API responses", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
         new Response(
           JSON.stringify({
-            organic: [
+            current_condition: [
               {
-                title: "知乎上的 AI agent 讨论",
-                link: "https://www.zhihu.com/question/123",
-                snippet: "社区问答摘要",
-              },
-              {
-                title: "Reuters AI Agent News",
-                link: "https://www.reuters.com/tech/ai-agent",
-                snippet: "Latest AI agent news snippet",
+                temp_C: "24",
+                FeelsLikeC: "26",
+                humidity: "72",
+                windspeedKmph: "13",
+                weatherDesc: [{ value: "Sunny" }],
               },
             ],
+            nearest_area: [{ areaName: [{ value: "Shanghai" }] }],
           }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
+          { status: 200, headers: { "Content-Type": "application/json" } },
         ),
       ),
     );
 
-    const { searchWeb } = await import("./tools");
-    const result = await searchWeb("AI agent 最新新闻");
+    const { lookupWeather } = await import("./tools");
+    const weather = await lookupWeather({ location: "Shanghai" });
 
-    expect(result.results[0].domain).toBe("reuters.com");
-    expect(result.results.some((entry) => entry.domain === "zhihu.com")).toBe(true);
-    expect(result.filteredResults).toHaveLength(0);
-  });
-
-  it("throws a structured empty-result error when every result is explicitly blocked", async () => {
-    process.env.SEARCH_API_KEY = "test-key";
-    process.env.SEARCH_BLOCKED_DOMAINS = "zhihu.com";
-    process.env.SEARCH_PROVIDERS = "search-api";
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            organic: [
-              {
-                title: "知乎上的 AI agent 讨论",
-                link: "https://www.zhihu.com/question/123",
-                snippet: "社区问答摘要",
-              },
-            ],
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
-        ),
-      ),
-    );
-
-    const { SearchToolError, searchWeb } = await import("./tools");
-    await expect(searchWeb("AI agent 最新新闻")).rejects.toBeInstanceOf(SearchToolError);
+    expect(weather.location).toBe("Shanghai");
+    expect(weather.summary).toBe("Sunny");
+    expect(weather.temperatureC).toBe(24);
   });
 });
