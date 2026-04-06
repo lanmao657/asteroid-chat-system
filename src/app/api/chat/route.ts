@@ -8,7 +8,11 @@ import {
   listSessionMessages,
   setSessionMemorySummary,
 } from "@/lib/agent/session-store";
-import type { AgentStreamEvent, ChatMessage } from "@/lib/agent/types";
+import {
+  insertAgentRunLog,
+  type PersistedAgentRunStatus,
+} from "@/lib/db/agent-run-log-repository";
+import type { AgentStreamEvent, ChatMessage, ToolResult } from "@/lib/agent/types";
 
 const requestSchema = z.object({
   sessionId: z.string().min(1),
@@ -39,12 +43,61 @@ const createStreamHeaders = () => ({
   "X-Content-Type-Options": "nosniff",
 });
 
+export const runtime = "nodejs";
+
+const persistRunLogSafely = async ({
+  runId,
+  sessionId,
+  provider,
+  status,
+  userMessage,
+  assistantMessage,
+  memorySummary,
+  toolResults,
+  errorMessage,
+  startedAt,
+  finishedAt,
+}: {
+  runId: string;
+  sessionId: string;
+  provider: string;
+  status: PersistedAgentRunStatus;
+  userMessage: string;
+  assistantMessage: string;
+  memorySummary: string;
+  toolResults: ToolResult[];
+  errorMessage?: string;
+  startedAt: string;
+  finishedAt: string;
+}) => {
+  try {
+    await insertAgentRunLog({
+      runId,
+      sessionId,
+      provider,
+      status,
+      userMessage,
+      assistantMessage,
+      memorySummary,
+      toolResults,
+      errorMessage,
+      startedAt,
+      finishedAt,
+    });
+  } catch (error) {
+    console.error("Failed to persist agent run log:", error);
+  }
+};
+
 export async function POST(request: Request) {
   const payload = requestSchema.parse(await request.json());
   ensureSession(payload.sessionId);
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      const startedAt = new Date().toISOString();
+      let currentRunId = "";
+      let providerLabel = "";
       let closed = false;
       const closeSafely = () => {
         if (!closed) {
@@ -53,6 +106,12 @@ export async function POST(request: Request) {
         }
       };
       const emit = (event: AgentStreamEvent) => {
+        if (event.type === "run_started") {
+          currentRunId = event.runId;
+        }
+        if (event.type === "session") {
+          providerLabel = event.provider;
+        }
         if (!closed) {
           controller.enqueue(encoder.encode(formatSse(event)));
         }
@@ -86,12 +145,40 @@ export async function POST(request: Request) {
           emit({ type: "assistant_final", message: assistantMessage });
         }
 
+        await persistRunLogSafely({
+          runId: result.runId,
+          sessionId: payload.sessionId,
+          provider: providerLabel || "unknown",
+          status: result.status === "aborted" ? "aborted" : "completed",
+          userMessage: payload.message,
+          assistantMessage: result.assistantText,
+          memorySummary: result.memorySummary,
+          toolResults: result.toolResults,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        });
+
         emit({ type: "done" });
       } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Unexpected server error";
         emit({
           type: "error",
-          message:
-            error instanceof Error ? error.message : "Unexpected server error",
+          message: errorMessage,
+        });
+
+        await persistRunLogSafely({
+          runId: currentRunId || crypto.randomUUID(),
+          sessionId: payload.sessionId,
+          provider: providerLabel || "unknown",
+          status: "errored",
+          userMessage: payload.message,
+          assistantMessage: "",
+          memorySummary: getSessionMemorySummary(payload.sessionId),
+          toolResults: [],
+          errorMessage,
+          startedAt,
+          finishedAt: new Date().toISOString(),
         });
       } finally {
         closeSafely();

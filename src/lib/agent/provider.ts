@@ -2,6 +2,7 @@ import { agentEnv } from "@/lib/agent/env";
 import { getPresentationStyleInstruction } from "@/lib/agent/presentation";
 import type {
   ChatMessage,
+  DecideWebSearchInput,
   GradeDocumentsInput,
   GradeDocumentsResult,
   LLMProvider,
@@ -11,6 +12,7 @@ import type {
   StreamAnswerInput,
   SummarizeConversationInput,
   ToolResult,
+  WebSearchToolDecision,
 } from "@/lib/agent/types";
 
 class ModelRequestError extends Error {
@@ -49,6 +51,7 @@ const formatToolResults = (toolResults: ToolResult[]) =>
     phase: result.phase,
     status: result.status,
     summary: result.summary,
+    detail: result.detail ? clip(result.detail, 600) : undefined,
   }));
 
 const average = (numbers: number[]) =>
@@ -116,6 +119,29 @@ class MockLLMProvider implements LLMProvider {
           averageScore,
           reason: "候选文档相关性偏弱，建议触发查询重写。",
         };
+  }
+
+  async decideWebSearchToolCall(
+    input: DecideWebSearchInput,
+  ): Promise<WebSearchToolDecision> {
+    const normalized = input.userMessage.toLowerCase();
+    const needsWebSearch =
+      /latest|recent|today|current|news|price|version|policy|result|score/.test(
+        normalized,
+      ) || /最新|实时|新闻|价格|版本|政策|结果|比分|官网/.test(input.userMessage);
+
+    if (!needsWebSearch) {
+      return {
+        status: "none",
+        reason: "Mock provider skipped web_search.",
+      };
+    }
+
+    return {
+      status: "call",
+      query: input.userMessage,
+      reason: "Mock provider requested web_search.",
+    };
   }
 
   async streamAnswer(input: StreamAnswerInput) {
@@ -300,7 +326,9 @@ class OpenAICompatibleProvider implements LLMProvider {
         };
   }
 
-  async streamAnswer(input: StreamAnswerInput) {
+  async decideWebSearchToolCall(
+    input: DecideWebSearchInput,
+  ): Promise<WebSearchToolDecision> {
     const response = await fetch(
       `${this.baseUrl.replace(/\/$/, "")}/chat/completions`,
       {
@@ -311,14 +339,167 @@ class OpenAICompatibleProvider implements LLMProvider {
         },
         body: JSON.stringify({
           model: this.model,
-          temperature: 0.2,
-          max_tokens: agentEnv.composeOutputTokenLimit,
-          stream: true,
-          messages: this.buildAnswerMessages(input),
+          temperature: 0,
+          max_tokens: 120,
+          tool_choice: "auto",
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "web_search",
+                description:
+                  "Search the live web for latest information, official sources, prices, policies, releases, and results.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    query: {
+                      type: "string",
+                      description: "A focused web search query.",
+                    },
+                  },
+                  required: ["query"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
+          messages: [
+            {
+              role: "system",
+              content: [
+                "You decide whether a live web search is necessary before answering a user.",
+                "Use the web_search tool only when the user needs current, changing, or official web information.",
+                "Examples: latest news, current status, official docs, prices, policy changes, release versions, sports results.",
+                "Do not call the tool for stable knowledge, code explanation, or ordinary refactoring questions.",
+                "If web search is unnecessary, do not call any tool.",
+              ].join(" "),
+            },
+            {
+              role: "user",
+              content: JSON.stringify(
+                {
+                  userMessage: clip(normalizeWhitespace(input.userMessage), 1_000),
+                  memorySummary: clip(input.memorySummary, 300),
+                  recentConversation: formatConversation(input.recentConversation).slice(-4),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
         }),
         signal: input.signal,
       },
+    ).catch((error) => {
+      if (input.signal?.aborted) {
+        throw error;
+      }
+
+      return null;
+    });
+
+    if (!response) {
+      return {
+        status: "disabled",
+        reason: "web_search tool calling is unavailable for the current endpoint.",
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        status: "disabled",
+        reason: `web_search tool calling is unavailable (${response.status}).`,
+      };
+    }
+
+    const payload = (await response.json()) as {
+      choices?: Array<{
+        message?: {
+          tool_calls?: Array<{
+            function?: {
+              name?: string;
+              arguments?: string;
+            };
+          }>;
+        };
+      }>;
+    };
+
+    const toolCall = payload.choices?.[0]?.message?.tool_calls?.find(
+      (item) => item.function?.name === "web_search",
     );
+
+    if (!toolCall?.function?.arguments) {
+      return {
+        status: "none",
+        reason: "Model chose not to call web_search.",
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(toolCall.function.arguments) as {
+        query?: string;
+      };
+      const query = normalizeWhitespace(parsed.query ?? "");
+
+      if (!query) {
+        return {
+          status: "none",
+          reason: "Model returned an empty web_search query.",
+        };
+      }
+
+      return {
+        status: "call",
+        query,
+        reason: "Model requested web_search.",
+      };
+    } catch {
+      return {
+        status: "none",
+        reason: "Model returned invalid web_search arguments.",
+      };
+    }
+  }
+
+  async streamAnswer(input: StreamAnswerInput) {
+    const messages = this.buildAnswerMessages(input);
+    let response: Response;
+
+    try {
+      response = await fetch(
+        `${this.baseUrl.replace(/\/$/, "")}/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            temperature: 0.2,
+            max_tokens: agentEnv.composeOutputTokenLimit,
+            stream: true,
+            messages,
+          }),
+          signal: input.signal,
+        },
+      );
+    } catch (error) {
+      if (input.signal?.aborted) {
+        throw error;
+      }
+
+      return this.completeWithFallback(
+        input,
+        messages,
+        new ModelRequestError(
+          "Streaming model request failed before receiving a response.",
+          503,
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
 
     if (!response.ok || !response.body) {
       let detail = "";
@@ -328,10 +509,14 @@ class OpenAICompatibleProvider implements LLMProvider {
         detail = "";
       }
 
-      throw new ModelRequestError(
-        `Model request failed with status ${response.status}`,
-        response.status,
-        detail,
+      return this.completeWithFallback(
+        input,
+        messages,
+        new ModelRequestError(
+          `Model request failed with status ${response.status}`,
+          response.status,
+          detail,
+        ),
       );
     }
 
@@ -368,7 +553,11 @@ class OpenAICompatibleProvider implements LLMProvider {
 
     const finalText = built.trim();
     if (!finalText) {
-      throw new ModelRequestError("Model response did not contain content.", 200);
+      return this.completeWithFallback(
+        input,
+        messages,
+        new ModelRequestError("Model response did not contain content.", 200),
+      );
     }
 
     return {
@@ -391,6 +580,9 @@ class OpenAICompatibleProvider implements LLMProvider {
           "Use memory summary and recent conversation when helpful.",
           "Ground the answer in the highest quality retrieval evidence available.",
           "When evidence is weak, explicitly say uncertainty is high.",
+          "When live web sources are available, cite the most useful source URLs in the answer.",
+          "If web search completed with empty status, say that live search was attempted but current providers did not return enough reliable results.",
+          "Do not claim that current news or events do not exist unless the retrieval evidence proves that.",
           "If structured presentation is appropriate, prefer clean Markdown headings and lists.",
           "Do not mention internal implementation details unless the user asks.",
           presentationStyleInstruction,
@@ -419,6 +611,68 @@ class OpenAICompatibleProvider implements LLMProvider {
         ),
       },
     ];
+  }
+
+  private async completeWithFallback(
+    input: StreamAnswerInput,
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+    error: ModelRequestError,
+  ) {
+    if (input.signal?.aborted) {
+      throw error;
+    }
+
+    try {
+      const text = await this.generateText(
+        messages,
+        input.signal,
+        agentEnv.composeOutputTokenLimit,
+      );
+      await input.onDelta(text);
+      return {
+        text,
+        finishReason: "stop" as const,
+      };
+    } catch (fallbackError) {
+      if (input.signal?.aborted) {
+        throw fallbackError;
+      }
+
+      const text = this.buildToolBasedFallbackAnswer(input, error);
+      await input.onDelta(text);
+      return {
+        text,
+        finishReason: "error" as const,
+      };
+    }
+  }
+
+  private buildToolBasedFallbackAnswer(
+    input: StreamAnswerInput,
+    error: ModelRequestError,
+  ) {
+    const sources = input.retrievalDocuments
+      .slice(0, 3)
+      .map((document) =>
+        document.url
+          ? `- ${document.title}: ${document.url}`
+          : `- ${document.title} (${document.source})`,
+      );
+
+    if (sources.length > 0) {
+      return [
+        "我已经完成了检索，但上游模型接口当前无法生成完整回答。",
+        `接口状态：${error.status}`,
+        "你可以先核对这些来源：",
+        ...sources,
+      ].join("\n");
+    }
+
+    return [
+      "我尝试完成回答，但上游模型接口当前不可用。",
+      `接口状态：${error.status}`,
+      "这次没有拿到足够可靠的检索结果，建议稍后重试或更换模型配置。",
+    ].join("\n");
   }
 
   private parseStreamFrame(frame: string): {

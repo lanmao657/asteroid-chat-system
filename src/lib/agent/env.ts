@@ -25,11 +25,16 @@ export const agentEnv = {
   continuationTailChars: asNumber(process.env.AGENT_CONTINUATION_TAIL_CHARS, 1_000),
   summaryTriggerMessages: asNumber(process.env.AGENT_SUMMARY_TRIGGER_MESSAGES, 8),
   summaryRecentWindow: asNumber(process.env.AGENT_SUMMARY_RECENT_WINDOW, 4),
+  tavilyApiBaseUrl:
+    process.env.TAVILY_API_BASE_URL?.trim() || "https://api.tavily.com/search",
+  tavilyApiKey: process.env.TAVILY_API_KEY?.trim() || "",
   searchApiBaseUrl:
     process.env.SEARCH_API_BASE_URL?.trim() || "https://google.serper.dev/search",
   searchApiKey: process.env.SEARCH_API_KEY?.trim() || "",
   searchMaxResults: asNumber(process.env.SEARCH_MAX_RESULTS, 5),
+  webSearchContentMaxChars: asNumber(process.env.WEB_SEARCH_CONTENT_MAX_CHARS, 420),
   searchProviders: asList(process.env.SEARCH_PROVIDERS, [
+    "tavily",
     "search-api",
     "duckduckgo-html",
     "bing-rss",

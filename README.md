@@ -64,3 +64,93 @@ npm run lint
 npm run test
 npm run typecheck
 ```
+
+## Web Search
+
+- `src/tools/webSearch.ts` adds a reusable `webSearch(query)` tool backed by Tavily.
+- `SEARCH_PROVIDERS` now prefers `tavily` and falls back to the existing providers.
+- The agent only attempts `web_search` for prompts that look like they need live web data.
+- If the model endpoint does not support function/tool calling, the chat flow degrades gracefully and continues without `web_search`.
+- If search fails or returns no results, the tool returns an empty result or an explicit failure path. It never fabricates search hits.
+
+## PostgreSQL Persistence
+
+- PostgreSQL is wired on the server side only. The frontend chat UI and SSE contract stay unchanged.
+- The existing in-memory session store is kept as-is to avoid breaking the current chat/runtime flow.
+- The first persisted business object is `agent_run_logs`, which records one row per agent turn.
+- Database access lives under `src/lib/db/`:
+  - `env.ts`: database env parsing
+  - `client.ts`: shared `pg` pool
+  - `schema.ts`: lazy `CREATE TABLE IF NOT EXISTS`
+  - `agent-run-log-repository.ts`: insert/query repository
+- A verification route is available at `GET /api/agent-runs?sessionId=<id>&limit=10`
+
+### Required env
+
+Add these to `.env.local` when enabling PostgreSQL locally:
+
+```bash
+DATABASE_URL=postgresql://lanmao:550695@localhost:5432/mydb
+DATABASE_MAX_CONNECTIONS=5
+DATABASE_IDLE_TIMEOUT_MS=30000
+DATABASE_CONNECTION_TIMEOUT_MS=5000
+```
+
+If `DATABASE_URL` is missing, the app still runs and the chat flow still works, but run logs will not be persisted.
+
+### Local PostgreSQL
+
+If you already have PostgreSQL installed locally:
+
+```bash
+createdb mydb
+```
+
+Or with Docker:
+
+```bash
+docker run --name xin-postgres -e POSTGRES_PASSWORD=550695 -e POSTGRES_USER=lanmao -e POSTGRES_DB=mydb -p 5432:5432 -d postgres:16
+```
+
+You can initialize the schema manually with:
+
+```bash
+psql postgresql://lanmao:550695@localhost:5432/mydb -f sql/init-postgres.sql
+```
+
+This project also lazily creates the table on first successful database write, so manual init is optional for local development.
+
+### Persisted table
+
+`agent_run_logs`
+
+- `run_id`: unique run identifier
+- `session_id`: current chat session id
+- `provider`: model/provider label emitted by the runtime
+- `status`: `completed`, `aborted`, or `errored`
+- `user_message`: incoming user prompt
+- `assistant_message`: final or partial assistant text
+- `memory_summary`: post-run memory summary snapshot
+- `tool_results`: JSONB payload of tool execution results
+- `error_message`: error detail when a run fails
+- `started_at` / `finished_at`: request lifecycle timestamps
+
+### Verification
+
+1. Start PostgreSQL and set `DATABASE_URL` in `.env.local`.
+2. Run `npm install`.
+3. Run `npm run dev`.
+4. Open `http://localhost:3000` and send one chat message.
+5. Query the persisted logs:
+
+```bash
+curl "http://localhost:3000/api/agent-runs?limit=5"
+```
+
+You should see the latest run log row in JSON.
+
+You can also verify directly in PostgreSQL:
+
+```bash
+psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_id, status, finished_at from agent_run_logs order by finished_at desc limit 5;"
+```

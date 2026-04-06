@@ -40,6 +40,13 @@ const createProvider = (): LLMProvider => ({
     averageScore: retrievalContext.length > 0 ? retrievalContext[0].scores.final : 0,
     reason: "graded",
   })),
+  decideWebSearchToolCall: vi.fn(async ({ userMessage }) => ({
+    status: /latest|recent|today|current|news/i.test(userMessage)
+      ? ("call" as const)
+      : ("none" as const),
+    reason: "decided",
+    query: userMessage,
+  })),
   streamAnswer: vi.fn(async ({ onDelta }) => {
     await onDelta("hello ");
     await onDelta("world");
@@ -112,7 +119,7 @@ describe("runAgentTurn", () => {
 
     const result = await runAgentTurn({
       sessionId: "session-2",
-      userMessage: "请从知识库里找一下 agent workspace 的设计说明",
+      userMessage: "search the knowledge base for agent workspace design docs",
       conversation: [],
       memorySummary: "",
       emit,
@@ -145,6 +152,10 @@ describe("runAgentTurn", () => {
         decision: "answer" as const,
         averageScore: 0.8,
         reason: "good enough",
+      })),
+      decideWebSearchToolCall: vi.fn(async () => ({
+        status: "none" as const,
+        reason: "not needed",
       })),
       streamAnswer: vi.fn(async ({ onDelta, signal }) => {
         await onDelta("partial");
@@ -188,6 +199,10 @@ describe("runAgentTurn", () => {
         averageScore: 0.9,
         reason: "good enough",
       })),
+      decideWebSearchToolCall: vi.fn(async () => ({
+        status: "none" as const,
+        reason: "not needed",
+      })),
       streamAnswer: vi.fn(async ({ onDelta }) => {
         await onDelta("this is a much longer streamed answer");
         return {
@@ -224,6 +239,10 @@ describe("runAgentTurn", () => {
         decision: "answer" as const,
         averageScore: 0.9,
         reason: "good enough",
+      })),
+      decideWebSearchToolCall: vi.fn(async () => ({
+        status: "none" as const,
+        reason: "not needed",
       })),
       streamAnswer: vi
         .fn()
@@ -286,6 +305,10 @@ describe("runAgentTurn", () => {
         averageScore: 0.9,
         reason: "good enough",
       })),
+      decideWebSearchToolCall: vi.fn(async () => ({
+        status: "none" as const,
+        reason: "not needed",
+      })),
       streamAnswer: vi.fn(async ({ onDelta }) => {
         await onDelta("more ");
         return {
@@ -315,5 +338,175 @@ describe("runAgentTurn", () => {
           event.progress.message === "Continuing -> limit reached",
       ),
     ).toBe(true);
+  });
+
+  it("uses model-requested web_search results without breaking tool events", async () => {
+    const provider = createProvider();
+    const search = vi.fn(async () => ({
+      provider: "tavily" as const,
+      queryUsed: "AI news last week",
+      rawCount: 3,
+      normalizedCount: 2,
+      filterReasons: { duplicate: 1 },
+      attempts: [
+        {
+          provider: "tavily" as const,
+          query: "AI news last week",
+          status: "success" as const,
+          rawCount: 3,
+          normalizedCount: 2,
+          keptCount: 1,
+          filteredCount: 1,
+          filterReasons: { duplicate: 1 },
+        },
+      ],
+      results: [
+        {
+          title: "Latest AI Agent News",
+          url: "https://www.reuters.com/technology/ai-agent-news",
+          snippet: "fresh result",
+          domain: "www.reuters.com",
+          evidence: "search-snippet" as const,
+          fetchStatus: "pending" as const,
+          rankingSignals: ["trusted-domain", "news-keyword"],
+          score: 12,
+        },
+      ],
+      filteredResults: [],
+    }));
+    const fetchPage = vi.fn(async () => ({
+      title: "Latest AI Agent News",
+      url: "https://www.reuters.com/technology/ai-agent-news",
+      description: "desc",
+      excerpt: "full page excerpt",
+    }));
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-7",
+      userMessage: "latest AI agent news",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        search,
+        fetchPage,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(provider.decideWebSearchToolCall).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(events.some((event) => event.type === "tool_started")).toBe(true);
+    expect(events.some((event) => event.type === "tool_result")).toBe(true);
+    const toolResultEvent = events.find(
+      (event) => event.type === "tool_result" && event.toolResult.tool === "searchWeb",
+    );
+    expect(toolResultEvent && toolResultEvent.type === "tool_result").toBe(true);
+    if (toolResultEvent?.type === "tool_result") {
+      const detail = JSON.parse(toolResultEvent.toolResult.detail ?? "{}") as Record<string, unknown>;
+      expect(detail.queryUsed).toBe("AI news last week");
+      expect(detail.providerUsed).toBe("tavily");
+      expect(detail.rawCount).toBe(3);
+      expect(detail.normalizedCount).toBe(2);
+      expect(detail.filterReasons).toEqual({ duplicate: 1 });
+    }
+  });
+
+  it("treats low-quality web results as empty and skips page fetches", async () => {
+    const provider = createProvider();
+    const search = vi.fn(async () => ({
+      provider: "bing-rss" as const,
+      results: [
+        {
+          title: "Forum thread",
+          url: "https://forum.example.com/thread",
+          snippet: "recent discussion",
+          domain: "forum.example.com",
+          evidence: "search-snippet" as const,
+          fetchStatus: "pending" as const,
+          rankingSignals: ["community-pattern"],
+          score: 1,
+        },
+      ],
+      filteredResults: [],
+    }));
+    const fetchPage = vi.fn();
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-8",
+      userMessage: "latest AI agent news",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        search,
+        fetchPage,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_result" &&
+          event.toolResult.tool === "searchWeb" &&
+          event.toolResult.status === "empty",
+      ),
+    ).toBe(true);
+  });
+
+  it("completes without an error event when provider returns a fallback answer", async () => {
+    const provider: LLMProvider = {
+      id: "test-provider",
+      label: "Test Provider",
+      summarizeConversation: vi.fn(async () => ""),
+      rewriteQuery: vi.fn(async () => ({
+        mode: "step-back" as const,
+        query: "rewritten",
+        reason: "reason",
+      })),
+      gradeDocuments: vi.fn(async () => ({
+        decision: "answer" as const,
+        averageScore: 0.9,
+        reason: "good enough",
+      })),
+      decideWebSearchToolCall: vi.fn(async () => ({
+        status: "call" as const,
+        query: "latest ai agent news",
+        reason: "requested",
+      })),
+      streamAnswer: vi.fn(async ({ onDelta }) => {
+        await onDelta("fallback answer from provider");
+        return {
+          text: "fallback answer from provider",
+          finishReason: "error" as const,
+        };
+      }),
+    };
+    const search = vi.fn(async () => ({
+      provider: "tavily" as const,
+      results: [],
+      filteredResults: [],
+    }));
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-9",
+      userMessage: "latest AI agent news",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: { provider, search },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.assistantText).toBe("fallback answer from provider");
+    expect(events.some((event) => event.type === "error")).toBe(false);
   });
 });

@@ -9,6 +9,7 @@ export interface ChatMessage {
 }
 
 export type SearchProviderName =
+  | "tavily"
   | "search-api"
   | "duckduckgo-html"
   | "bing-rss"
@@ -40,6 +41,18 @@ export interface SearchResult {
   skipReason?: string;
   rankingSignals?: string[];
   score?: number;
+}
+
+export interface WebSearchResultItem {
+  title: string;
+  url: string;
+  content: string;
+}
+
+export interface WebSearchResponse {
+  status: "success" | "empty";
+  provider: SearchProviderName;
+  results: WebSearchResultItem[];
 }
 
 export interface FetchedPage {
@@ -179,6 +192,19 @@ export interface StreamAnswerInput {
   onDelta: (delta: string) => void | Promise<void>;
 }
 
+export interface DecideWebSearchInput {
+  userMessage: string;
+  recentConversation: ChatMessage[];
+  memorySummary: string;
+  signal?: AbortSignal;
+}
+
+export interface WebSearchToolDecision {
+  status: "call" | "none" | "disabled";
+  reason: string;
+  query?: string;
+}
+
 export type ModelFinishReason = "stop" | "length" | "abort" | "error" | "unknown";
 
 export interface StreamAnswerResult {
@@ -206,6 +232,7 @@ export interface LLMProvider {
   streamAnswer(input: StreamAnswerInput): Promise<StreamAnswerResult>;
   rewriteQuery(input: RewriteQueryInput): Promise<QueryRewriteResult>;
   gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult>;
+  decideWebSearchToolCall(input: DecideWebSearchInput): Promise<WebSearchToolDecision>;
 }
 
 export type AgentStreamEvent =

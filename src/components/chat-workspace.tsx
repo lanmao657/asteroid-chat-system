@@ -657,7 +657,7 @@ export function ChatWorkspace() {
     sessions.find((session) => session.id === activeSessionId)?.title ?? "新对话";
 
   return (
-    <div className={styles.shell}>
+    <div className={styles.shell} data-sidebar-open={isSidebarOpen}>
       <button
         aria-hidden={!isSidebarOpen}
         className={styles.sidebarBackdrop}

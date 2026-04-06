@@ -12,7 +12,6 @@ import type {
   AgentStreamEvent,
   ChatMessage,
   FetchedPage,
-  GradeDocumentsResult,
   LLMProvider,
   ModelFinishReason,
   RetrievalDocument,
@@ -53,7 +52,7 @@ const SEARCH_SIGNALS = [
 ];
 
 const WEATHER_SIGNALS = ["天气", "气温", "下雨", "weather", "forecast", "temperature"];
-const KNOWLEDGE_SIGNALS = ["知识库", "文档", "内部", "产品", "企业", "设计", "kb", "docs"];
+const KNOWLEDGE_SIGNALS = ["知识库", "文档", "内部", "产品", "企业", "设计", "knowledge base", "docs", "documentation", "kb"];
 
 const isAbortError = (error: unknown, signal?: AbortSignal) =>
   signal?.aborted ||
@@ -143,22 +142,26 @@ const makeStep = (
   metadata,
 });
 
-const buildSearchSummary = (
-  results: SearchResult[],
-  filteredResults: SearchResult[],
-  provider: string,
-) => {
-  if (results.length === 0) {
-    return {
-      status: "empty" as const,
-      summary: `检索已完成，但 ${provider} 没有保留到足够相关的结果。`,
-    };
+const isUsableWebResult = (result: SearchResult) => {
+  const signals = result.rankingSignals ?? [];
+  if (signals.includes("community-pattern")) {
+    return false;
+  }
+  if (signals.includes("low-quality-domain")) {
+    return false;
+  }
+  if (result.skipReason === "blocked-domain") {
+    return false;
+  }
+  if (result.score == null) {
+    return true;
   }
 
-  return {
-    status: "success" as const,
-    summary: `检索完成，保留 ${results.length} 条结果，过滤 ${filteredResults.length} 条来源。`,
-  };
+  if (signals.includes("trusted-domain") || signals.includes("news-keyword")) {
+    return result.score >= 1;
+  }
+
+  return result.score >= -1;
 };
 
 const chooseRewriteStrategy = (turn: number): "step-back" | "hyde" =>
@@ -356,7 +359,7 @@ export const runAgentTurn = async ({
         emit({
           type: "memory_compacted",
           summary: nextMemorySummary,
-          message: "已压缩旧消息并保留最近上下文。",
+          message: "Compacted older messages and kept recent context.",
           degraded: false,
         });
       } catch (error) {
@@ -364,7 +367,7 @@ export const runAgentTurn = async ({
           emit({
             type: "assistant_aborted",
             runId,
-            message: "已停止当前回答。",
+            message: "Current answer was aborted.",
           });
           return abortedState();
         }
@@ -372,7 +375,7 @@ export const runAgentTurn = async ({
         emit({
           type: "memory_compacted",
           summary: nextMemorySummary,
-          message: "旧消息摘要失败，本轮继续沿用现有摘要。",
+          message: "Failed to summarize older messages, reusing the existing memory summary.",
           degraded: true,
         });
       }
@@ -387,12 +390,12 @@ export const runAgentTurn = async ({
         callId: routeCall.id,
         tool: "searchWeb",
         message: `Routing -> ${routed}`,
-        detail: "根据问题类型在天气、知识库和网页检索之间选择最合适的工具。",
+        detail: "Choose the best retrieval tool among weather, knowledge base, and web search.",
       },
     });
 
     const trace: RetrievalStep[] = [
-      makeStep("routing", "Routing", `本轮选择 ${routed} 路由`, {
+      makeStep("routing", "Routing", `Selected ${routed} route for this turn.`, {
         route: routed,
       }),
     ];
@@ -406,13 +409,13 @@ export const runAgentTurn = async ({
           callId: weatherCall.id,
           tool: "weatherLookup",
           message: "Searching -> Weather API",
-          detail: "正在查询天气服务。",
+          detail: "Querying the weather service.",
         },
       });
 
       const location = userMessage
-        .replace(/.*?(天气|weather|forecast|temperature)/i, "")
-        .replace(/[？?。!！]/g, "")
+        .replace(/.*?(\u5929\u6c14|weather|forecast|temperature)/i, "")
+        .replace(/[^\p{L}\p{N}\s-]/gu, "")
         .trim() || "Shanghai";
       const weather = await weatherLookup({ location, signal });
 
@@ -421,18 +424,18 @@ export const runAgentTurn = async ({
         tool: "weatherLookup",
         phase: "weather",
         status: "success",
-        summary: `天气查询完成：${weather.location}，${weather.summary}`,
+        summary: `Weather lookup completed: ${weather.location}, ${weather.summary}`,
         payload: weather,
         provider: "weather-api",
         trace: [
-        ...trace,
+          ...trace,
           makeStep(
             "searching",
             "Searching",
-            `查询天气：${weather.location}`,
+            `Weather lookup for ${weather.location}`,
             weather as unknown as Record<string, unknown>,
           ),
-          makeStep("completed", "Completed", "天气结果已经可用于回答。"),
+          makeStep("completed", "Completed", "Weather results are ready for the answer."),
         ],
       };
       retrievalDocuments.push({
@@ -466,14 +469,14 @@ export const runAgentTurn = async ({
         makeStep(
           "searching",
           "Searching",
-          `知识库 ${kbResponse.strategy} 检索完成，召回 ${kbResponse.documents.length} 条候选`,
+          `Knowledge-base ${kbResponse.strategy} search completed with ${kbResponse.documents.length} candidate(s).`,
           {
             strategy: kbResponse.strategy,
           },
         ),
         kbResponse.reranked
-          ? makeStep("reranking", "Reranking", "Jina API 精排已完成。")
-          : makeStep("reranking", "Reranking", "未启用或未成功执行外部精排，沿用本地排序。"),
+          ? makeStep("reranking", "Reranking", "Jina API reranking completed.")
+          : makeStep("reranking", "Reranking", "Jina reranking unavailable, using local ranking instead."),
       ];
 
       const gradeCall = createToolCall("knowledgeBaseSearch", "grade", {
@@ -487,7 +490,7 @@ export const runAgentTurn = async ({
           callId: gradeCall.id,
           tool: "knowledgeBaseSearch",
           message: "Grading -> grade_documents",
-          detail: "正在判断召回文档是否足够支撑回答。",
+          detail: "Checking whether the retrieved documents are sufficient to answer.",
         },
       });
 
@@ -513,8 +516,8 @@ export const runAgentTurn = async ({
           progress: {
             callId: rewriteCall.id,
             tool: "knowledgeBaseSearch",
-            message: `Rewriting -> ${strategy}`,
-            detail: "正在根据低相关性结果重写查询。",
+            message: "Rewriting -> " + strategy,
+            detail: "Rewriting the knowledge-base query because the retrieved documents are weak.",
           },
         });
 
@@ -550,7 +553,7 @@ export const runAgentTurn = async ({
         tool: "knowledgeBaseSearch",
         phase: "search",
         status: rewrittenDocs.length > 0 ? "success" : "empty",
-        summary: `知识库检索完成，保留 ${rewrittenDocs.length} 条候选，评分结论：${grade.decision}`,
+        summary: `Knowledge-base retrieval completed with ${rewrittenDocs.length} candidate(s); grading decision: ${grade.decision}.`,
         payload: rewrittenDocs,
         provider: "knowledge-base",
         keptCount: rewrittenDocs.length,
@@ -565,7 +568,7 @@ export const runAgentTurn = async ({
             averageScore: grade.averageScore,
             decision: grade.decision,
           }),
-          makeStep("completed", "Completed", "知识库检索链路结束。"),
+          makeStep("completed", "Completed", "Knowledge-base retrieval finished."),
         ],
       };
       toolResults.push(kbResult);
@@ -573,24 +576,52 @@ export const runAgentTurn = async ({
     }
 
     if (routed === "web") {
-      let activeQuery = userMessage;
-      let finalGrade: GradeDocumentsResult | null = null;
+      const decision = await provider.decideWebSearchToolCall({
+        userMessage,
+        recentConversation,
+        memorySummary: nextMemorySummary,
+        signal,
+      });
 
-      for (let rewriteTurn = 0; rewriteTurn < 2; rewriteTurn += 1) {
-        const searchCall = createToolCall("searchWeb", "search", { query: activeQuery });
+      if (decision.status !== "call" || !decision.query) {
+        const skippedResult: ToolResult = {
+          callId: crypto.randomUUID(),
+          tool: "searchWeb",
+          phase: "search",
+          status: "skipped",
+          summary:
+            decision.status === "disabled"
+              ? "web_search is unavailable for the current model endpoint."
+              : "Model chose not to call web_search for this request.",
+          payload: [],
+          detail: JSON.stringify(decision),
+          trace: [
+            ...trace,
+            makeStep("completed", "Completed", decision.reason, {
+              status: decision.status,
+            }),
+          ],
+        };
+        toolResults.push(skippedResult);
+        emit({ type: "tool_result", toolResult: skippedResult });
+      } else {
+        const searchCall = createToolCall("searchWeb", "search", {
+          query: decision.query,
+          requestedByModel: true,
+        });
         emit({ type: "tool_started", toolCall: searchCall });
         emit({
           type: "tool_progress",
           progress: {
             callId: searchCall.id,
             tool: "searchWeb",
-            message: "Searching -> Web",
-            detail: `当前查询：${activeQuery}`,
+            message: "Searching -> web_search",
+            detail: decision.query,
           },
         });
 
         const response = await search({
-          query: activeQuery,
+          query: decision.query,
           signal,
           onProgress: (progress) =>
             emit({
@@ -599,22 +630,11 @@ export const runAgentTurn = async ({
             }),
         });
 
-        searchResults.splice(0, searchResults.length, ...response.results);
-        const searchSummary = buildSearchSummary(
-          response.results,
-          response.filteredResults,
-          response.provider,
-        );
-        const webTrace: RetrievalStep[] = [
-          ...trace,
-          makeStep("searching", "Searching", searchSummary.summary, {
-            provider: response.provider,
-            query: activeQuery,
-          }),
-        ];
-
+        const usableResults = response.results.filter((result) => isUsableWebResult(result));
+        searchResults.splice(0, searchResults.length, ...usableResults);
         pageContents.splice(0, pageContents.length);
-        for (const [index, result] of response.results
+
+        for (const [index, result] of usableResults
           .slice(0, agentEnv.fetchMaxPages)
           .entries()) {
           const fetchCall = createToolCall("fetchWebPage", "fetch", { url: result.url });
@@ -626,6 +646,7 @@ export const runAgentTurn = async ({
               tool: "fetchWebPage",
               message: `Fetching -> ${index + 1}/${Math.min(
                 response.results.length,
+                usableResults.length,
                 agentEnv.fetchMaxPages,
               )}`,
               detail: result.url,
@@ -641,7 +662,7 @@ export const runAgentTurn = async ({
               emit({
                 type: "assistant_aborted",
                 runId,
-                message: "已停止当前回答。",
+                message: "Current answer was aborted.",
               });
               return abortedState();
             }
@@ -652,106 +673,54 @@ export const runAgentTurn = async ({
         retrievalDocuments.splice(
           0,
           retrievalDocuments.length,
-          ...toRetrievalDocumentsFromSearch(response.results, pageContents),
+          ...toRetrievalDocumentsFromSearch(usableResults, pageContents),
         );
 
-        const gradeCall = createToolCall("searchWeb", "grade", {
-          query: activeQuery,
-          candidates: retrievalDocuments.length,
-        });
-        emit({ type: "tool_started", toolCall: gradeCall });
-        emit({
-          type: "tool_progress",
-          progress: {
-            callId: gradeCall.id,
-            tool: "searchWeb",
-            message: "Grading -> grade_documents",
-            detail: "正在判断网页候选是否足够相关。",
-          },
-        });
+        const summary =
+          usableResults.length > 0
+            ? `Web search completed with ${usableResults.length} usable result(s).`
+            : "Live web search was attempted, but current providers did not return enough reliable results.";
 
-        finalGrade = await provider.gradeDocuments({
-          userMessage,
-          retrievalContext: retrievalDocuments,
-          signal,
-        });
-
-        if (finalGrade.decision === "answer" || rewriteTurn === 1) {
-          const webResult: ToolResult = {
-            callId: searchCall.id,
-            tool: "searchWeb",
-            phase: "search",
-            status: searchSummary.status,
-            summary: `网页检索完成，${finalGrade.reason}`,
-            payload: response.results,
-            provider: response.provider,
-            keptCount: response.results.length,
-            filteredCount: response.filteredResults.length,
-            detail: JSON.stringify({
-              queryUsed: activeQuery,
-              averageScore: finalGrade.averageScore,
-              decision: finalGrade.decision,
-            }),
-            trace: [
-              ...webTrace,
-              makeStep("grading", "Grading", finalGrade.reason, {
-                averageScore: finalGrade.averageScore,
-                decision: finalGrade.decision,
-              }),
-              makeStep("completed", "Completed", "网页检索链路结束。"),
-            ],
-          };
-          toolResults.push(webResult);
-          emit({ type: "tool_result", toolResult: webResult });
-          break;
-        }
-
-        const strategy = chooseRewriteStrategy(rewriteTurn);
-        const rewriteCall = createToolCall("searchWeb", "rewrite", {
-          query: activeQuery,
-          strategy,
-        });
-        emit({ type: "tool_started", toolCall: rewriteCall });
-        emit({
-          type: "tool_progress",
-          progress: {
-            callId: rewriteCall.id,
-            tool: "searchWeb",
-            message: `Rewriting -> ${strategy}`,
-            detail: "候选相关性不足，准备触发重写检索。",
-          },
-        });
-
-        const rewrite = await provider.rewriteQuery({
-          userMessage,
-          retrievalContext: retrievalDocuments,
-          strategyHint: strategy,
-          signal,
-        });
-        activeQuery = rewrite.query;
-
-        const rewriteResult: ToolResult = {
-          callId: rewriteCall.id,
+        const webResult: ToolResult = {
+          callId: searchCall.id,
           tool: "searchWeb",
-          phase: "rewrite",
-          status: "success",
-          summary: `查询已重写为 ${rewrite.mode} 模式`,
-          payload: [],
-          provider: "search-api",
-          detail: JSON.stringify(rewrite),
+          phase: "search",
+          status: usableResults.length > 0 ? "success" : "empty",
+          summary,
+          payload: usableResults,
+          provider: response.provider,
+          keptCount: usableResults.length,
+          filteredCount: response.filteredResults.length,
+          detail: JSON.stringify({
+            queryUsed: response.queryUsed ?? decision.query,
+            decisionReason: decision.reason,
+            providerUsed: response.provider,
+            rawCount: response.rawCount ?? response.results.length + response.filteredResults.length,
+            normalizedCount:
+              response.normalizedCount ?? response.results.length + response.filteredResults.length,
+            keptCount: usableResults.length,
+            filteredCount: response.filteredResults.length,
+            filterReasons: response.filterReasons ?? {},
+            discardedCount: response.results.length - usableResults.length,
+            attempts: response.attempts ?? [],
+          }),
           trace: [
             ...trace,
-            makeStep("rewriting", "Rewriting", rewrite.reason, {
-              mode: rewrite.mode,
-              query: rewrite.query,
+            makeStep("searching", "Searching", summary, {
+              provider: response.provider,
+              query: response.queryUsed ?? decision.query,
             }),
+            makeStep("completed", "Completed", "web_search finished."),
           ],
         };
-        toolResults.push(rewriteResult);
-        emit({ type: "tool_result", toolResult: rewriteResult });
+        toolResults.push(webResult);
+        emit({ type: "tool_result", toolResult: webResult });
       }
     }
 
+    if (false && routed === "web") {
+      // Legacy web rewrite path intentionally disabled.
+    }
     const answerResult = await streamAssistantWithContinuations({
       provider,
       userMessage,
@@ -785,7 +754,7 @@ export const runAgentTurn = async ({
       emit({
         type: "assistant_aborted",
         runId,
-        message: "已停止当前回答。",
+        message: "Current answer was aborted.",
       });
       return abortedState();
     }
@@ -796,13 +765,13 @@ export const runAgentTurn = async ({
         tool: "searchWeb",
         phase: "search",
         status: "error",
-        summary: "检索链路失败，本轮退回到直接回答。",
+        summary: "Web retrieval failed, so this turn falls back to a direct answer.",
         payload: [],
         provider: error.provider,
         errorType: error.type,
         detail: error.detail ?? error.message,
         trace: [
-          makeStep("completed", "Completed", "检索链路异常结束。", {
+          makeStep("completed", "Completed", "Web retrieval stopped with an error.", {
             error: error.message,
           }),
         ],
@@ -843,3 +812,4 @@ export const runAgentTurn = async ({
     throw error;
   }
 };
+

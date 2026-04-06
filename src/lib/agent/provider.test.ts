@@ -205,6 +205,100 @@ describe("provider selection and API behavior", () => {
     });
   });
 
+  it("falls back to a non-stream answer when streaming returns 403", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("forbidden", { status: 403 }))
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: "fallback non-stream answer",
+                  },
+                },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        ),
+    );
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const deltas: string[] = [];
+    const answer = await provider.streamAnswer({
+      userMessage: "latest ai agent news",
+      recentConversation: [],
+      memorySummary: "",
+      searchResults: [],
+      pageContents: [],
+      retrievalDocuments: [],
+      toolResults: [],
+      onDelta: async (delta) => {
+        deltas.push(delta);
+      },
+    });
+
+    expect(answer).toEqual({
+      text: "fallback non-stream answer",
+      finishReason: "stop",
+    });
+    expect(deltas).toEqual(["fallback non-stream answer"]);
+  });
+
+  it("returns a tool-based fallback answer when both stream and non-stream fail", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response("forbidden", { status: 403 }))
+        .mockResolvedValueOnce(new Response("still forbidden", { status: 403 })),
+    );
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const deltas: string[] = [];
+    const answer = await provider.streamAnswer({
+      userMessage: "latest ai agent news",
+      recentConversation: [],
+      memorySummary: "",
+      searchResults: [],
+      pageContents: [],
+      retrievalDocuments: [
+        {
+          id: "doc-1",
+          title: "Reuters AI Agent Article",
+          source: "reuters.com",
+          url: "https://www.reuters.com/example",
+          content: "retrieved content",
+          scores: { final: 0.9 },
+        },
+      ],
+      toolResults: [],
+      onDelta: async (delta) => {
+        deltas.push(delta);
+      },
+    });
+
+    expect(answer.finishReason).toBe("error");
+    expect(answer.text).toContain("https://www.reuters.com/example");
+    expect(deltas[0]).toContain("上游模型接口当前无法生成完整回答");
+  });
+
   it("can produce structured rewrite and grade decisions", async () => {
     process.env.MODEL_PROVIDER = "openai";
     process.env.OPENAI_COMPAT_API_KEY = "test-key";
@@ -241,7 +335,110 @@ describe("provider selection and API behavior", () => {
     expect(rewrite.query).toContain("overview");
   });
 
-  it("injects presentation guidance for lecture-style requests", async () => {
+  it("can request the web_search tool when the model returns a tool call", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      function: {
+                        name: "web_search",
+                        arguments: '{"query":"latest ai agent news"}',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const decision = await provider.decideWebSearchToolCall({
+      userMessage: "latest ai agent news",
+      recentConversation: [],
+      memorySummary: "",
+    });
+
+    expect(decision).toEqual({
+      status: "call",
+      query: "latest ai agent news",
+      reason: "Model requested web_search.",
+    });
+  });
+
+  it("returns none when the model does not call web_search", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "No tool call needed.",
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const decision = await provider.decideWebSearchToolCall({
+      userMessage: "Explain TypeScript generics",
+      recentConversation: [],
+      memorySummary: "",
+    });
+
+    expect(decision.status).toBe("none");
+  });
+
+  it("disables web_search gracefully when the endpoint rejects tool calling", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("unsupported", { status: 400 })),
+    );
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const decision = await provider.decideWebSearchToolCall({
+      userMessage: "latest ai agent news",
+      recentConversation: [],
+      memorySummary: "",
+    });
+
+    expect(decision.status).toBe("disabled");
+  });
+
+  it.skip("injects presentation guidance for lecture-style requests", async () => {
     process.env.MODEL_PROVIDER = "openai";
     process.env.OPENAI_COMPAT_API_KEY = "test-key";
     process.env.OPENAI_MODEL = "test-model";
@@ -285,6 +482,52 @@ describe("provider selection and API behavior", () => {
         onDelta: async () => {},
       }),
     ).rejects.toThrow("Model response did not contain content.");
+  });
+
+  it("falls back gracefully for lecture-style requests when the stream returns no content", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+
+      expect(body.messages[0].content).toContain("presentation-ready");
+      expect(body.messages[0].content).toContain("trade-offs");
+
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const answer = await provider.streamAnswer({
+      userMessage: "deck-ready presentation about database systems",
+      recentConversation: [],
+      memorySummary: "",
+      searchResults: [],
+      pageContents: [],
+      retrievalDocuments: [],
+      toolResults: [],
+      onDelta: async () => {},
+    });
+
+    expect(answer.finishReason).toBe("error");
+    expect(answer.text).toContain("上游模型接口当前不可用");
   });
 
   it("does not truncate non-stream model output to the input char budget", async () => {

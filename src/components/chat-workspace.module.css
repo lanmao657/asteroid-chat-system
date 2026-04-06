@@ -180,6 +180,7 @@
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
+  transition: padding-left 220ms ease;
 }
 
 .topbar {
@@ -220,7 +221,7 @@
 }
 
 .chatFrame {
-  width: min(100%, 900px);
+  width: min(100%, 1240px);
   height: 100%;
   margin: 0 auto;
   display: grid;
@@ -278,7 +279,7 @@
 }
 
 .message {
-  width: min(100%, 820px);
+  width: min(100%, 960px);
   display: grid;
   gap: 10px;
   padding: 16px 18px;
@@ -431,8 +432,8 @@
 .composerSurface {
   width: 100%;
   border: 1px solid rgba(17, 24, 28, 0.08);
-  border-radius: 28px;
-  padding: 18px;
+  border-radius: 24px;
+  padding: 14px;
   background: rgba(255, 255, 255, 0.9);
   box-shadow: 0 16px 48px rgba(15, 23, 42, 0.08);
   backdrop-filter: blur(18px);
@@ -440,7 +441,7 @@
 
 .textarea {
   width: 100%;
-  min-height: 108px;
+  min-height: 80px;
   resize: none;
   border: 0;
   outline: 0;
@@ -454,8 +455,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 18px;
-  margin-top: 14px;
+  gap: 12px;
+  margin-top: 10px;
 }
 
 .composerHint {
@@ -465,7 +466,7 @@
 
 .sendButton {
   min-width: 108px;
-  height: 44px;
+  height: 40px;
   border: 0;
   border-radius: 14px;
   background: linear-gradient(135deg, #10a37f 0%, #0f766e 100%);
@@ -490,8 +491,8 @@
     width: 296px;
   }
 
-  .main {
-    padding-left: 0;
+  .shell[data-sidebar-open="true"] .main {
+    padding-left: 296px;
   }
 
   .sidebarBackdrop {
@@ -530,11 +531,11 @@
 
   .composerSurface {
     border-radius: 22px;
-    padding: 16px;
+    padding: 14px;
   }
 
   .textarea {
-    min-height: 92px;
+    min-height: 72px;
   }
 
   .composerFooter {

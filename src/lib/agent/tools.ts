@@ -1,7 +1,8 @@
-import * as cheerio from "cheerio";
+﻿import * as cheerio from "cheerio";
 
 import { agentEnv } from "@/lib/agent/env";
 import { knowledgeBaseDocuments } from "@/lib/agent/knowledge-base";
+import { webSearch, WebSearchError } from "@/tools/webSearch";
 import type {
   FetchedPage,
   RetrievalDocument,
@@ -28,6 +29,21 @@ export interface SearchResponse {
   provider: SearchProviderName;
   results: SearchResult[];
   filteredResults: SearchResult[];
+  queryUsed?: string;
+  rawCount?: number;
+  normalizedCount?: number;
+  filterReasons?: Record<string, number>;
+  attempts?: Array<{
+    provider: SearchProviderName;
+    query: string;
+    status: "success" | "empty" | "error";
+    rawCount: number;
+    normalizedCount: number;
+    keptCount: number;
+    filteredCount: number;
+    filterReasons: Record<string, number>;
+    detail?: string;
+  }>;
 }
 
 export interface KnowledgeBaseSearchResponse {
@@ -38,6 +54,7 @@ export interface KnowledgeBaseSearchResponse {
 }
 
 const SEARCH_PROVIDER_ORDER: SearchProviderName[] = [
+  "tavily",
   "search-api",
   "duckduckgo-html",
   "bing-rss",
@@ -45,23 +62,6 @@ const SEARCH_PROVIDER_ORDER: SearchProviderName[] = [
 
 const BLOCKED_DOMAINS = agentEnv.searchBlockedDomains.map((item) => item.toLowerCase());
 const DEMOTED_DOMAINS = agentEnv.searchDemotedDomains.map((item) => item.toLowerCase());
-const NEWS_KEYWORDS = [
-  "最新",
-  "最近",
-  "今天",
-  "今日",
-  "新闻",
-  "实时",
-  "搜一下",
-  "查一下",
-  "latest",
-  "recent",
-  "today",
-  "current",
-  "news",
-  "search",
-  "web",
-];
 const TRUSTED_NEWS_DOMAINS = [
   "reuters.com",
   "apnews.com",
@@ -74,6 +74,72 @@ const TRUSTED_NEWS_DOMAINS = [
   "ithome.com",
   "caixin.com",
 ];
+const CLEAN_NEWS_KEYWORDS = [
+  "\u6700\u65b0",
+  "\u6700\u8fd1",
+  "\u4eca\u5929",
+  "\u4eca\u65e5",
+  "\u65b0\u95fb",
+  "\u5b9e\u65f6",
+  "\u641c\u4e00\u4e0b",
+  "\u67e5\u4e00\u4e0b",
+  "latest",
+  "recent",
+  "today",
+  "current",
+  "news",
+  "search",
+  "web",
+];
+const LOW_QUALITY_NEWS_DOMAINS = [
+  "baidu.com",
+  "jingyan.baidu.com",
+  "tieba.baidu.com",
+  "wordreference.com",
+];
+const COMMUNITY_PATTERNS =
+  /question|answer|forum|community|thread|\u8d34\u5427|\u95ee\u7b54|\u77e5\u4e4e|quora|reddit/i;
+const QUERY_NOISE_TERMS = new Set([
+  ...CLEAN_NEWS_KEYWORDS,
+  "\u91cd\u8981",
+  "\u9886\u57df",
+  "\u8fc7\u53bb",
+  "\u4e00\u5468",
+  "\u4e03\u5929",
+  "\u54ea\u4e9b",
+  "\u6709\u54ea\u4e9b",
+  "\u6709\u4ec0\u4e48",
+  "\u6807\u9898",
+  "\u53d1\u5e03",
+  "\u53d1\u5e03\u65f6\u95f4",
+  "\u5a92\u4f53",
+  "\u5a92\u4f53\u6765\u6e90",
+  "\u6765\u6e90",
+  "major",
+  "important",
+  "week",
+  "weeks",
+  "day",
+  "days",
+  "last",
+  "past",
+  "publish",
+  "published",
+  "publication",
+  "source",
+  "sources",
+]);
+const AI_TOPIC_PATTERN =
+  /\bai\b|artificial intelligence|\u4eba\u5de5\u667a\u80fd|\u667a\u80fd\u4f53|agent|agents|llm|\u5927\u6a21\u578b/i;
+const BROAD_AI_ENTITY_QUERY = "OpenAI Anthropic Google Meta AI news last week";
+
+interface FilterAndRankResponse {
+  results: SearchResult[];
+  filteredResults: SearchResult[];
+  rawCount: number;
+  normalizedCount: number;
+  filterReasons: Record<string, number>;
+}
 
 const normalizeWhitespace = (value: string) =>
   value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
@@ -190,7 +256,114 @@ const matchesDomainList = (domain: string, list: string[]) =>
 
 const isNewsLikeQuery = (query: string) => {
   const normalized = query.toLowerCase();
-  return NEWS_KEYWORDS.some((keyword) => normalized.includes(keyword));
+  return CLEAN_NEWS_KEYWORDS.some((keyword) => normalized.includes(keyword));
+};
+
+const extractQueryTerms = (query: string) =>
+  {
+    const extracted = normalizeWhitespace(query)
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
+    .filter(Boolean)
+    .filter(
+      (term) =>
+        !QUERY_NOISE_TERMS.has(term) &&
+        !["about", "the", "a", "an", "for"].includes(term),
+    );
+
+    if (
+      (/\bartificial\b/.test(extracted.join(" ")) || extracted.includes("intelligence")) &&
+      !extracted.includes("ai")
+    ) {
+      extracted.unshift("ai");
+    }
+
+    return dedupeStrings(extracted);
+  };
+
+const dedupeStrings = (values: string[]) => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values.map((item) => normalizeWhitespace(item)).filter(Boolean)) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(value);
+  }
+
+  return result;
+};
+
+const buildTopicLabels = (query: string) => {
+  const normalized = normalizeWhitespace(query);
+  const lower = normalized.toLowerCase();
+
+  if (/openai/i.test(normalized)) {
+    return { topicEn: "OpenAI", topicZh: "OpenAI", broadAi: false };
+  }
+
+  if (/anthropic/i.test(normalized)) {
+    return { topicEn: "Anthropic", topicZh: "Anthropic", broadAi: false };
+  }
+
+  if (/google|gemini/i.test(normalized)) {
+    return { topicEn: "Google AI", topicZh: "Google AI", broadAi: false };
+  }
+
+  if (/meta|llama/i.test(normalized)) {
+    return { topicEn: "Meta AI", topicZh: "Meta AI", broadAi: false };
+  }
+
+  if (/microsoft/i.test(normalized)) {
+    return { topicEn: "Microsoft AI", topicZh: "Microsoft AI", broadAi: false };
+  }
+
+  if (/nvidia/i.test(normalized)) {
+    return { topicEn: "NVIDIA AI", topicZh: "NVIDIA AI", broadAi: false };
+  }
+
+  if (AI_TOPIC_PATTERN.test(lower)) {
+    return { topicEn: "AI", topicZh: "AI", broadAi: true };
+  }
+
+  const extracted = extractQueryTerms(normalized).slice(0, 4);
+  const topic = extracted.join(" ").trim() || normalized;
+  return { topicEn: topic, topicZh: topic, broadAi: false };
+};
+
+const buildQueryCandidates = (query: string) => {
+  const normalized = normalizeWhitespace(query);
+
+  if (!isNewsLikeQuery(normalized)) {
+    return [normalized];
+  }
+
+  const { topicEn, topicZh, broadAi } = buildTopicLabels(normalized);
+  const expandedTopicEn = broadAi && topicEn === "AI" ? "artificial intelligence" : topicEn;
+  const candidates = [
+    `${topicEn} news last week`,
+    `${expandedTopicEn} major news past 7 days`,
+    broadAi ? BROAD_AI_ENTITY_QUERY : "",
+    `\u6700\u8fd1\u4e00\u5468 ${topicZh} \u91cd\u8981\u65b0\u95fb`,
+    `${topicZh} \u6700\u65b0\u65b0\u95fb \u8fc7\u53bb7\u5929`,
+    normalized,
+  ];
+
+  return dedupeStrings(candidates).slice(0, 5);
+};
+
+const hasTopicCoverage = (query: string, result: SearchResult) => {
+  const terms = extractQueryTerms(query);
+  if (terms.length === 0) {
+    return true;
+  }
+
+  const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
+  const matched = terms.filter((term) => haystack.includes(term));
+  return matched.length >= 1;
 };
 
 const rankSearchResult = (result: SearchResult, isNewsQuery: boolean) => {
@@ -198,7 +371,7 @@ const rankSearchResult = (result: SearchResult, isNewsQuery: boolean) => {
   const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
   const signals: string[] = [];
 
-  if (isNewsQuery && NEWS_KEYWORDS.some((keyword) => haystack.includes(keyword))) {
+  if (isNewsQuery && CLEAN_NEWS_KEYWORDS.some((keyword) => haystack.includes(keyword))) {
     score += 8;
     signals.push("news-keyword");
   }
@@ -213,8 +386,13 @@ const rankSearchResult = (result: SearchResult, isNewsQuery: boolean) => {
     signals.push("demoted-domain");
   }
 
-  if (/question|answer|问答|贴吧|community|forum/.test(haystack)) {
-    score -= 6;
+  if (matchesDomainList(result.domain, LOW_QUALITY_NEWS_DOMAINS)) {
+    score -= 12;
+    signals.push("low-quality-domain");
+  }
+
+  if (COMMUNITY_PATTERNS.test(haystack)) {
+    score -= 10;
     signals.push("community-pattern");
   }
 
@@ -233,9 +411,39 @@ const createSearchResult = (title: string, url: string, snippet: string): Search
   rankingSignals: [],
 });
 
-const filterAndRankResults = (query: string, rawResults: SearchResult[]) => {
+const countFilterReasons = (results: SearchResult[]) =>
+  results.reduce<Record<string, number>>((accumulator, result) => {
+    const reason = result.skipReason ?? "unknown";
+    accumulator[reason] = (accumulator[reason] ?? 0) + 1;
+    return accumulator;
+  }, {});
+
+const filterAndRankResults = (
+  query: string,
+  rawResults: SearchResult[],
+): FilterAndRankResponse => {
   const filteredResults: SearchResult[] = [];
-  const ranked = rawResults
+  const newsQuery = isNewsLikeQuery(query);
+  const dedupedResults: SearchResult[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const result of rawResults) {
+    const dedupeKey = result.url || `${result.title}::${result.domain}`;
+    if (seenKeys.has(dedupeKey)) {
+      filteredResults.push({
+        ...result,
+        fetchStatus: "skipped",
+        skipReason: "duplicate",
+        rankingSignals: [...(result.rankingSignals ?? []), "duplicate"],
+      });
+      continue;
+    }
+
+    seenKeys.add(dedupeKey);
+    dedupedResults.push(result);
+  }
+
+  const rankedEntries = dedupedResults
     .map((result) => {
       const blocked = matchesDomainList(result.domain, BLOCKED_DOMAINS);
       if (blocked) {
@@ -248,15 +456,69 @@ const filterAndRankResults = (query: string, rawResults: SearchResult[]) => {
         return null;
       }
 
-      const score = rankSearchResult(result, isNewsLikeQuery(query));
+      const score = rankSearchResult(result, newsQuery);
+      const topicCovered = hasTopicCoverage(query, result);
+      const isCommunity = result.rankingSignals?.includes("community-pattern");
+      const isLowQualityDomain = result.rankingSignals?.includes("low-quality-domain");
+      const lowScoreForNews = newsQuery && score < 2 && !result.rankingSignals?.includes("trusted-domain");
+      const lowQualityForNews =
+        newsQuery && (!topicCovered || Boolean(isCommunity) || Boolean(isLowQualityDomain) || lowScoreForNews);
+
+      if (lowQualityForNews) {
+        const skipReason = !topicCovered
+          ? "topic-mismatch"
+          : isCommunity
+            ? "community-pattern"
+            : isLowQualityDomain
+              ? "low-quality-domain"
+              : "low-score";
+        filteredResults.push({
+          ...result,
+          fetchStatus: "skipped",
+          skipReason,
+          rankingSignals: [...(result.rankingSignals ?? []), "filtered-low-quality-news"],
+        });
+        return null;
+      }
+
       return { result, score };
     })
     .filter((entry): entry is { result: SearchResult; score: number } => Boolean(entry))
-    .sort((left, right) => right.score - left.score)
-    .slice(0, agentEnv.searchMaxResults)
-    .map((entry) => entry.result);
+    .sort((left, right) => right.score - left.score);
 
-  return { results: ranked, filteredResults };
+  const ranked: SearchResult[] = [];
+  for (const [index, entry] of rankedEntries.entries()) {
+    const passesNewsThreshold =
+      !newsQuery || entry.score >= 2 || index < Math.min(3, agentEnv.searchMaxResults);
+
+    if (!passesNewsThreshold) {
+      filteredResults.push({
+        ...entry.result,
+        fetchStatus: "skipped",
+        skipReason: "score-threshold",
+      });
+      continue;
+    }
+
+    if (ranked.length >= agentEnv.searchMaxResults) {
+      filteredResults.push({
+        ...entry.result,
+        fetchStatus: "skipped",
+        skipReason: "result-limit",
+      });
+      continue;
+    }
+
+    ranked.push(entry.result);
+  }
+
+  return {
+    results: ranked,
+    filteredResults,
+    rawCount: rawResults.length,
+    normalizedCount: dedupedResults.length,
+    filterReasons: countFilterReasons(filteredResults),
+  };
 };
 
 const decodeDuckDuckGoUrl = (href: string) => {
@@ -437,6 +699,19 @@ const runSearchProvider = async (
   query: string,
   signal?: AbortSignal,
 ) => {
+  if (provider === "tavily") {
+    const response = await webSearch(query, { signal });
+    if (response.status === "empty") {
+      throw new SearchToolError("Tavily returned no results.", "empty", "tavily");
+    }
+
+    return filterAndRankResults(
+      query,
+      response.results.map((result) =>
+        createSearchResult(result.title, result.url, result.content),
+      ),
+    );
+  }
   if (provider === "search-api") {
     return searchWithSearchApi(query, signal);
   }
@@ -466,45 +741,153 @@ export const searchWeb = async ({
   );
 
   const orderedProviders = providers.length > 0 ? providers : SEARCH_PROVIDER_ORDER;
+  const queryCandidates = buildQueryCandidates(query);
+  const totalAttempts = orderedProviders.length * queryCandidates.length;
   let lastError: SearchToolError | null = null;
+  let lastEmptyProvider: SearchProviderName | null = null;
+  let lastAttemptQuery = query;
+  const attempts: NonNullable<SearchResponse["attempts"]> = [];
 
-  for (const [index, provider] of orderedProviders.entries()) {
-    throwIfAborted(signal);
-    onProgress?.({
-      callId: "",
-      tool: "searchWeb",
-      message:
-        index === 0
-          ? `正在尝试 ${provider} 搜索源`
-          : `主搜索未命中，切换到 ${provider}`,
-      provider,
-      step: index + 1,
-      totalSteps: orderedProviders.length,
-    });
+  for (const [providerIndex, provider] of orderedProviders.entries()) {
+    for (const [queryIndex, candidateQuery] of queryCandidates.entries()) {
+      throwIfAborted(signal);
+      lastAttemptQuery = candidateQuery;
 
-    try {
-      const result = await runSearchProvider(provider, query, signal);
-      return { provider, ...result };
-    } catch (error) {
-      if (error instanceof SearchToolError) {
-        if (error.type === "aborted") {
-          throw error;
-        }
-        lastError = error;
-        continue;
-      }
-
-      if (isAbortError(error)) {
-        throw new SearchToolError("Request aborted.", "aborted", provider);
-      }
-
-      lastError = new SearchToolError(
-        "Search request failed.",
-        "unknown",
+      onProgress?.({
+        callId: "",
+        tool: "searchWeb",
+        message: `Searching -> ${provider}`,
         provider,
-        error instanceof Error ? error.message : String(error),
-      );
+        step: providerIndex * queryCandidates.length + queryIndex + 1,
+        totalSteps: totalAttempts,
+        detail: candidateQuery,
+      });
+
+      try {
+        const result = await runSearchProvider(provider, candidateQuery, signal);
+        attempts.push({
+          provider,
+          query: candidateQuery,
+          status: result.results.length > 0 ? "success" : "empty",
+          rawCount: result.rawCount,
+          normalizedCount: result.normalizedCount,
+          keptCount: result.results.length,
+          filteredCount: result.filteredResults.length,
+          filterReasons: result.filterReasons,
+        });
+
+        if (result.results.length > 0) {
+          return {
+            provider,
+            ...result,
+            queryUsed: candidateQuery,
+            attempts,
+          };
+        }
+
+        lastEmptyProvider = provider;
+        onProgress?.({
+          callId: "",
+          tool: "searchWeb",
+          message: `Retrying -> ${provider}`,
+          provider,
+          step: providerIndex * queryCandidates.length + queryIndex + 1,
+          totalSteps: totalAttempts,
+          detail: JSON.stringify({
+            query: candidateQuery,
+            rawCount: result.rawCount,
+            normalizedCount: result.normalizedCount,
+            keptCount: result.results.length,
+            filteredCount: result.filteredResults.length,
+            filterReasons: result.filterReasons,
+          }),
+        });
+        continue;
+      } catch (error) {
+        if (error instanceof WebSearchError) {
+          if (error.type === "aborted") {
+            throw new SearchToolError(error.message, error.type, error.provider, error.detail);
+          }
+
+          attempts.push({
+            provider: error.provider,
+            query: candidateQuery,
+            status: error.type === "empty" ? "empty" : "error",
+            rawCount: 0,
+            normalizedCount: 0,
+            keptCount: 0,
+            filteredCount: 0,
+            filterReasons: error.type === "empty" ? { provider_empty: 1 } : {},
+            detail: error.detail ?? error.message,
+          });
+
+          if (error.type === "empty") {
+            lastEmptyProvider = error.provider;
+            continue;
+          }
+
+          lastError = new SearchToolError(error.message, error.type, error.provider, error.detail);
+          continue;
+        }
+
+        if (error instanceof SearchToolError) {
+          if (error.type === "aborted") {
+            throw error;
+          }
+
+          attempts.push({
+            provider: error.provider,
+            query: candidateQuery,
+            status: error.type === "empty" ? "empty" : "error",
+            rawCount: 0,
+            normalizedCount: 0,
+            keptCount: 0,
+            filteredCount: 0,
+            filterReasons: error.type === "empty" ? { provider_empty: 1 } : {},
+            detail: error.detail ?? error.message,
+          });
+
+          if (error.type === "empty") {
+            lastEmptyProvider = error.provider;
+            continue;
+          }
+          lastError = error;
+          continue;
+        }
+
+        if (isAbortError(error)) {
+          throw new SearchToolError("Request aborted.", "aborted", provider);
+        }
+
+        const detail = error instanceof Error ? error.message : String(error);
+        attempts.push({
+          provider,
+          query: candidateQuery,
+          status: "error",
+          rawCount: 0,
+          normalizedCount: 0,
+          keptCount: 0,
+          filteredCount: 0,
+          filterReasons: {},
+          detail,
+        });
+        lastError = new SearchToolError("Search request failed.", "unknown", provider, detail);
+      }
     }
+  }
+
+  if (lastEmptyProvider) {
+    const lastAttempt = attempts[attempts.length - 1];
+    return {
+      provider: lastEmptyProvider,
+      results: [],
+      filteredResults: [],
+      queryUsed: lastAttemptQuery,
+      rawCount: lastAttempt?.rawCount ?? 0,
+      normalizedCount: lastAttempt?.normalizedCount ?? 0,
+      filterReasons: lastAttempt?.filterReasons ?? {},
+      attempts,
+    };
   }
 
   throw (
@@ -585,7 +968,7 @@ export const searchKnowledgeBase = async ({
   onProgress?.({
     callId: "",
     tool: "knowledgeBaseSearch",
-    message: "正在执行混合检索（稀疏 + 密集）",
+    message: "Running hybrid retrieval (sparse + dense)",
     provider: "knowledge-base",
   });
 
@@ -657,7 +1040,7 @@ export const searchKnowledgeBase = async ({
     onProgress?.({
       callId: "",
       tool: "knowledgeBaseSearch",
-      message: "混合检索降级为纯密集检索",
+      message: "Hybrid retrieval degraded to dense-only retrieval",
       provider: "knowledge-base",
     });
 
@@ -690,7 +1073,7 @@ export const searchKnowledgeBase = async ({
     onProgress?.({
       callId: "",
       tool: "knowledgeBaseSearch",
-      message: "正在调用 Jina Rerank 精排",
+      message: "Calling Jina rerank",
       provider: "knowledge-base",
     });
 
@@ -742,7 +1125,7 @@ export const searchKnowledgeBase = async ({
       onProgress?.({
         callId: "",
         tool: "knowledgeBaseSearch",
-        message: "Jina 精排失败，继续使用本地 hybrid 排序",
+        message: "Jina rerank failed, keeping the local hybrid ranking",
         provider: "knowledge-base",
       });
     }
