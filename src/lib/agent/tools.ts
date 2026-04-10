@@ -129,6 +129,31 @@ const QUERY_NOISE_TERMS = new Set([
   "source",
   "sources",
 ]);
+const GENERIC_NEWS_ROUNDUP_TERMS = new Set([
+  "国内",
+  "国际",
+  "国内国际",
+  "国内国际要闻",
+  "要闻",
+  "今日要闻",
+  "今天要闻",
+  "重要新闻",
+  "新闻摘要",
+  "摘要",
+  "简报",
+  "晨会",
+  "晨会摘要",
+  "晨会同步",
+  "同步",
+  "头条",
+  "headline",
+  "headlines",
+  "brief",
+  "briefing",
+  "roundup",
+  "summary",
+  "top",
+]);
 const AI_TOPIC_PATTERN =
   /\bai\b|artificial intelligence|\u4eba\u5de5\u667a\u80fd|\u667a\u80fd\u4f53|agent|agents|llm|\u5927\u6a21\u578b/i;
 const BROAD_AI_ENTITY_QUERY = "OpenAI Anthropic Google Meta AI news last week";
@@ -143,6 +168,65 @@ interface FilterAndRankResponse {
 
 const normalizeWhitespace = (value: string) =>
   value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+
+const extractMeaningfulTerms = (value: string) =>
+  normalizeWhitespace(value)
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
+    .filter(Boolean)
+    .filter(
+      (term) =>
+        !QUERY_NOISE_TERMS.has(term) &&
+        !GENERIC_NEWS_ROUNDUP_TERMS.has(term) &&
+        !/^(?:20\d{2}|20\d{2}\u5e74)$/.test(term) &&
+        !["about", "the", "a", "an", "for"].includes(term),
+    );
+
+const stripRelativeDateYear = (query: string) => {
+  const normalized = normalizeWhitespace(query);
+  const hasRelativeDateSignal =
+    /(?:\b(?:today|current|latest|recent)\b|\u4eca\u5929|\u4eca\u65e5|\u5f53\u524d|\u5b9e\u65f6|\u6700\u65b0|\u6700\u8fd1)/i.test(
+      normalized,
+    );
+  const hasExplicitYearReference = /(?:^|[^\d])20\d{2}(?:\u5e74)?(?=$|[^\d])/u.test(normalized);
+
+  if (!hasRelativeDateSignal) {
+    return normalized;
+  }
+
+  if (
+    hasExplicitYearReference &&
+    extractMeaningfulTerms(stripGenericNewsRoundupNoise(normalized)).length > 0
+  ) {
+    return normalized;
+  }
+
+  const currentYear = new Date().getFullYear();
+  return normalizeWhitespace(
+    normalized
+      .replace(
+        new RegExp(`(?!${currentYear}年)20\\d{2}年`, "g"),
+        "",
+      )
+      .replace(
+        new RegExp(`\\b(?!${currentYear}\\b)20\\d{2}\\b`, "g"),
+        "",
+      ),
+  );
+};
+
+const stripGenericNewsRoundupNoise = (query: string) =>
+  normalizeWhitespace(query)
+    .replace(/20\d{2}年?/g, " ")
+    .replace(/(?:今天|今日|当前|实时|最新|最近一周|过去7天|过去七天)/gu, " ")
+    .replace(/\b(?:today|current|latest|recent|last week|past 7 days)\b/gi, " ")
+    .replace(
+      /(?:国内国际要闻|国内国际|今日要闻|今天要闻|重要新闻|新闻摘要|晨会摘要|晨会同步|晨会|摘要|简报|同步|头条)/gu,
+      " ",
+    )
+    .replace(/\b(?:headline|headlines|brief|briefing|roundup|summary|top news)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
 const isAbortError = (error: unknown) =>
   error instanceof Error &&
@@ -261,15 +345,7 @@ const isNewsLikeQuery = (query: string) => {
 
 const extractQueryTerms = (query: string) =>
   {
-    const extracted = normalizeWhitespace(query)
-    .toLowerCase()
-    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
-    .filter(Boolean)
-    .filter(
-      (term) =>
-        !QUERY_NOISE_TERMS.has(term) &&
-        !["about", "the", "a", "an", "for"].includes(term),
-    );
+    const extracted = extractMeaningfulTerms(stripRelativeDateYear(query));
 
     if (
       (/\bartificial\b/.test(extracted.join(" ")) || extracted.includes("intelligence")) &&
@@ -280,6 +356,22 @@ const extractQueryTerms = (query: string) =>
 
     return dedupeStrings(extracted);
   };
+
+const isGenericNewsRoundupQuery = (query: string) => {
+  const normalized = stripRelativeDateYear(query);
+  if (!isNewsLikeQuery(normalized)) {
+    return false;
+  }
+
+  const compact = stripGenericNewsRoundupNoise(normalized);
+  if (!compact) {
+    return true;
+  }
+
+  const extracted = extractMeaningfulTerms(compact);
+
+  return dedupeStrings(extracted).length === 0;
+};
 
 const dedupeStrings = (values: string[]) => {
   const seen = new Set<string>();
@@ -298,7 +390,7 @@ const dedupeStrings = (values: string[]) => {
 };
 
 const buildTopicLabels = (query: string) => {
-  const normalized = normalizeWhitespace(query);
+  const normalized = stripRelativeDateYear(query);
   const lower = normalized.toLowerCase();
 
   if (/openai/i.test(normalized)) {
@@ -335,10 +427,20 @@ const buildTopicLabels = (query: string) => {
 };
 
 const buildQueryCandidates = (query: string) => {
-  const normalized = normalizeWhitespace(query);
+  const normalized = stripRelativeDateYear(query);
 
   if (!isNewsLikeQuery(normalized)) {
     return [normalized];
+  }
+
+  if (isGenericNewsRoundupQuery(normalized)) {
+    return dedupeStrings([
+      "top news today",
+      "world news today",
+      "\u4eca\u65e5\u8981\u95fb",
+      "\u56fd\u5185 \u56fd\u9645 \u4eca\u65e5\u8981\u95fb",
+      normalized,
+    ]).slice(0, 5);
   }
 
   const { topicEn, topicZh, broadAi } = buildTopicLabels(normalized);
@@ -356,6 +458,15 @@ const buildQueryCandidates = (query: string) => {
 };
 
 const hasTopicCoverage = (query: string, result: SearchResult) => {
+  if (isGenericNewsRoundupQuery(query)) {
+    return (
+      matchesDomainList(result.domain, TRUSTED_NEWS_DOMAINS) ||
+      CLEAN_NEWS_KEYWORDS.some((keyword) =>
+        `${result.title} ${result.snippet}`.toLowerCase().includes(keyword),
+      )
+    );
+  }
+
   const terms = extractQueryTerms(query);
   if (terms.length === 0) {
     return true;

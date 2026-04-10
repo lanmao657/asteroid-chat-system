@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runAgentTurn } from "./runtime";
+import { SearchToolError } from "./tools";
 import type { AgentStreamEvent, LLMProvider, RetrievalDocument } from "./types";
 
 const collectEvents = () => {
@@ -508,5 +509,87 @@ describe("runAgentTurn", () => {
     expect(result.status).toBe("completed");
     expect(result.assistantText).toBe("fallback answer from provider");
     expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("extracts the weather location from Chinese queries before calling the weather tool", async () => {
+    const provider = createProvider();
+    const weatherLookup = vi.fn(async ({ location }: { location: string }) => ({
+      location,
+      summary: "Light rain",
+      temperatureC: 29,
+      feelsLikeC: 33,
+      humidity: 82,
+      windKph: 12,
+    }));
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-10",
+      userMessage: "帮我查一下新加坡今天的天气，并给出穿衣和出行建议。",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        weatherLookup,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(weatherLookup).toHaveBeenCalledWith(
+      expect.objectContaining({ location: "新加坡" }),
+    );
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_result" &&
+          event.toolResult.tool === "weatherLookup" &&
+          event.toolResult.status === "success",
+      ),
+    ).toBe(true);
+  });
+
+  it("reports weather lookup failures as weather tool errors instead of web search failures", async () => {
+    const provider = createProvider();
+    const weatherLookup = vi.fn(async () => {
+      throw new SearchToolError(
+        "Weather lookup failed with status 500.",
+        "http",
+        "weather-api",
+        "HTTP 500",
+      );
+    });
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-11",
+      userMessage: "帮我查一下新加坡今天的天气",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        weatherLookup,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    const toolResultEvent = events.find(
+      (event) =>
+        event.type === "tool_result" &&
+        event.toolResult.status === "error",
+    );
+
+    expect(toolResultEvent?.type).toBe("tool_result");
+    if (toolResultEvent?.type === "tool_result") {
+      expect(toolResultEvent.toolResult.tool).toBe("weatherLookup");
+      expect(toolResultEvent.toolResult.phase).toBe("weather");
+      expect(toolResultEvent.toolResult.summary).toBe(
+        "Weather lookup failed, so this turn falls back to a direct answer.",
+      );
+      expect(toolResultEvent.toolResult.provider).toBe("weather-api");
+      expect(toolResultEvent.toolResult.errorType).toBe("http");
+      expect(toolResultEvent.toolResult.detail).toBe("HTTP 500");
+    }
   });
 });

@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
-import { DM_Sans, IBM_Plex_Mono, Geist } from "next/font/google";
+import { DM_Sans, Geist, IBM_Plex_Mono } from "next/font/google";
+
 import "./globals.css";
 import { cn } from "@/lib/utils";
 
-const geist = Geist({subsets:['latin'],variable:'--font-sans'});
+const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
 
 const bodyFont = DM_Sans({
   variable: "--font-body",
@@ -18,8 +19,9 @@ const monoFont = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "小行星",
-  description: "小行星是一个中文智能对话空间，聚焦简洁的历史对话管理与沉浸式聊天体验。",
+  title: "Asteroid Chat",
+  description:
+    "Asteroid Chat 是一个桌面端智能对话工作台，保留 agent、检索与工具能力，同时提供更成熟的聊天产品体验。",
 };
 
 export default function RootLayout({
@@ -28,7 +30,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className={cn(bodyFont.variable, monoFont.variable, "font-sans", geist.variable)}>
+    <html
+      className={cn(bodyFont.variable, monoFont.variable, "font-sans", geist.variable)}
+      lang="zh-CN"
+    >
       <body>{children}</body>
     </html>
   );

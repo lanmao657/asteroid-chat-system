@@ -37,6 +37,13 @@ const clip = (value: string, max: number) => {
 const normalizeWhitespace = (value: string) =>
   value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
 
+const getCurrentDateLabel = () => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+};
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const formatConversation = (conversation: ChatMessage[]) =>
@@ -329,6 +336,7 @@ class OpenAICompatibleProvider implements LLMProvider {
   async decideWebSearchToolCall(
     input: DecideWebSearchInput,
   ): Promise<WebSearchToolDecision> {
+    const currentDate = getCurrentDateLabel();
     const response = await fetch(
       `${this.baseUrl.replace(/\/$/, "")}/chat/completions`,
       {
@@ -368,9 +376,11 @@ class OpenAICompatibleProvider implements LLMProvider {
               role: "system",
               content: [
                 "You decide whether a live web search is necessary before answering a user.",
+                `Today is ${currentDate}.`,
                 "Use the web_search tool only when the user needs current, changing, or official web information.",
                 "Examples: latest news, current status, official docs, prices, policy changes, release versions, sports results.",
                 "Do not call the tool for stable knowledge, code explanation, or ordinary refactoring questions.",
+                "When the user asks for today's or latest news, keep the query concise, use the current date context, and do not invent an old year unless the user explicitly asked for that year.",
                 "If web search is unnecessary, do not call any tool.",
               ].join(" "),
             },

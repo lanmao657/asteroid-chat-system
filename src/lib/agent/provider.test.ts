@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 describe("provider selection and API behavior", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.resetModules();
     vi.restoreAllMocks();
     delete process.env.MODEL_PROVIDER;
@@ -414,6 +415,52 @@ describe("provider selection and API behavior", () => {
     });
 
     expect(decision.status).toBe("none");
+  });
+
+  it("injects the local calendar date instead of UTC into web search decisions", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 8, 0, 30, 0));
+    vi.spyOn(Date.prototype, "toISOString").mockReturnValue("2026-04-07T16:30:00.000Z");
+
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+
+      expect(body.messages[0]?.content).toContain("Today is 2026-04-08.");
+      expect(body.messages[0]?.content).not.toContain("Today is 2026-04-07.");
+
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "No tool call needed.",
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const decision = await provider.decideWebSearchToolCall({
+      userMessage: "latest ai agent news",
+      recentConversation: [],
+      memorySummary: "",
+    });
+
+    expect(decision.status).toBe("none");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("disables web_search gracefully when the endpoint rejects tool calling", async () => {

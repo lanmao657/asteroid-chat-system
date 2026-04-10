@@ -73,6 +73,9 @@ const createToolCall = (
 const countConversationChars = (messages: ChatMessage[]) =>
   messages.reduce((total, message) => total + message.content.length, 0);
 
+const normalizeWhitespace = (value: string) =>
+  value.replace(/\s+/g, " ").replace(/\u00a0/g, " ").trim();
+
 const shouldSearch = (value: string) => {
   const normalized = value.toLowerCase();
   return SEARCH_SIGNALS.some((signal) => normalized.includes(signal.toLowerCase()));
@@ -86,6 +89,54 @@ const isWeatherQuery = (value: string) => {
 const isKnowledgeQuery = (value: string) => {
   const normalized = value.toLowerCase();
   return KNOWLEDGE_SIGNALS.some((signal) => normalized.includes(signal.toLowerCase()));
+};
+
+const cleanWeatherLocationCandidate = (value: string) =>
+  normalizeWhitespace(value)
+    .replace(/^[,，。！？!?;；:\s-]+|[,，。！？!?;；:\s-]+$/gu, "")
+    .replace(
+      /^(?:(?:帮我|请|麻烦|我想知道|想知道|查一下|查一查|搜一下|搜索一下|看一下|看看|告诉我|帮忙|请问)\s*)+/u,
+      "",
+    )
+    .replace(/\b(?:please|tell me|show me|check|what is|what's)\b/gi, "")
+    .replace(/\b(?:the weather in|weather in|forecast for|forecast in|temperature in|temperature for)\b/gi, "")
+    .replace(/(?:今天|今日|明天|后天|现在|当前|实时)/gu, "")
+    .replace(/\b(?:today|tomorrow|now|current|currently)\b/gi, "")
+    .replace(/(?:并|并且|而且|顺便|再|以及|和).*/u, "")
+    .replace(/\b(?:and|with)\b.*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^的+|的+$/gu, "")
+    .trim();
+
+const extractWeatherLocation = (userMessage: string) => {
+  const normalized = normalizeWhitespace(userMessage);
+
+  const beforeChineseWeather = normalized.match(
+    /(.+?)(?:今天|今日|明天|后天|现在|当前|实时)?(?:的)?(?:天气|气温|天气预报)/u,
+  );
+  const beforeEnglishWeather = normalized.match(
+    /(.+?)\b(?:weather|forecast|temperature)\b/i,
+  );
+  const afterEnglishWeather = normalized.match(
+    /\b(?:weather|forecast|temperature)\b(?:\s+(?:in|for|at))?\s+(.+)/i,
+  );
+  const afterChineseWeather = normalized.match(/(?:天气|气温|天气预报)(?:在)?(.+)/u);
+
+  const candidates = [
+    beforeChineseWeather?.[1],
+    afterEnglishWeather?.[1],
+    beforeEnglishWeather?.[1],
+    afterChineseWeather?.[1],
+  ];
+
+  for (const candidate of candidates) {
+    const cleaned = candidate ? cleanWeatherLocationCandidate(candidate) : "";
+    if (cleaned) {
+      return cleaned;
+    }
+  }
+
+  return "Shanghai";
 };
 
 const routeRetrieval = (userMessage: string): RouteTarget => {
@@ -327,6 +378,7 @@ export const runAgentTurn = async ({
   const pageContents: FetchedPage[] = [];
   const retrievalDocuments: RetrievalDocument[] = [];
   let assistantText = "";
+  let routed: RouteTarget = "none";
 
   const abortedState = (): AgentState => ({
     sessionId,
@@ -381,7 +433,7 @@ export const runAgentTurn = async ({
       }
     }
 
-    const routed = routeRetrieval(userMessage);
+    routed = routeRetrieval(userMessage);
     const routeCall = createToolCall("searchWeb", "route", { userMessage, route: routed });
     emit({ type: "tool_started", toolCall: routeCall });
     emit({
@@ -413,10 +465,7 @@ export const runAgentTurn = async ({
         },
       });
 
-      const location = userMessage
-        .replace(/.*?(\u5929\u6c14|weather|forecast|temperature)/i, "")
-        .replace(/[^\p{L}\p{N}\s-]/gu, "")
-        .trim() || "Shanghai";
+      const location = extractWeatherLocation(userMessage);
       const weather = await weatherLookup({ location, signal });
 
       const weatherResult: ToolResult = {
@@ -760,19 +809,39 @@ export const runAgentTurn = async ({
     }
 
     if (error instanceof SearchToolError) {
+      const failedTool =
+        routed === "weather"
+          ? "weatherLookup"
+          : routed === "knowledge-base"
+            ? "knowledgeBaseSearch"
+            : "searchWeb";
+      const failedPhase = routed === "weather" ? "weather" : "search";
+      const failedSummary =
+        routed === "weather"
+          ? "Weather lookup failed, so this turn falls back to a direct answer."
+          : routed === "knowledge-base"
+            ? "Knowledge-base retrieval failed, so this turn falls back to a direct answer."
+            : "Web retrieval failed, so this turn falls back to a direct answer.";
+      const failedTraceDetail =
+        routed === "weather"
+          ? "Weather lookup stopped with an error."
+          : routed === "knowledge-base"
+            ? "Knowledge-base retrieval stopped with an error."
+            : "Web retrieval stopped with an error.";
       const failedResult: ToolResult = {
         callId: crypto.randomUUID(),
-        tool: "searchWeb",
-        phase: "search",
+        tool: failedTool,
+        phase: failedPhase,
         status: "error",
-        summary: "Web retrieval failed, so this turn falls back to a direct answer.",
+        summary: failedSummary,
         payload: [],
         provider: error.provider,
         errorType: error.type,
         detail: error.detail ?? error.message,
         trace: [
-          makeStep("completed", "Completed", "Web retrieval stopped with an error.", {
+          makeStep("completed", "Completed", failedTraceDetail, {
             error: error.message,
+            route: routed,
           }),
         ],
       };

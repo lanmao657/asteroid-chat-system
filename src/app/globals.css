@@ -7,6 +7,10 @@
 :root {
   --ink-strong: #111827;
   --ink-soft: #667085;
+  --ink-faint: #8b8f97;
+  --chat-border: rgba(17, 24, 39, 0.08);
+  --chat-shadow-soft: 0 10px 26px rgba(17, 24, 39, 0.04);
+  --chat-shadow-large: 0 24px 60px rgba(17, 24, 39, 0.08);
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -56,6 +60,7 @@ body {
   display: flex;
   flex-direction: column;
   font-family: var(--font-body), sans-serif;
+  background: #f5f5f2;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

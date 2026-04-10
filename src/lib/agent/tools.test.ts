@@ -244,4 +244,71 @@ describe("searchWeb, knowledgeBaseSearch, fetchWebPage, and weatherLookup", () =
     expect(result.queryUsed).toBe("OpenAI API official docs");
     expect(result.results).toHaveLength(1);
   });
+
+  it("keeps trusted results for broad daily news roundup queries instead of filtering them all out", async () => {
+    process.env.SEARCH_PROVIDERS = "bing-rss";
+
+    const fetchSpy = vi.fn(async () =>
+      new Response(
+        `<?xml version="1.0"?><rss><channel>
+          <item><title>Reuters World News</title><link>https://www.reuters.com/world/example</link><description>Top news today from Reuters</description></item>
+          <item><title>AP Top Headlines</title><link>https://apnews.com/article/example</link><description>Today's major headlines</description></item>
+        </channel></rss>`,
+        {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml" },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { searchWeb } = await import("./tools");
+    const result = await searchWeb({
+      query: "2024年今天重要新闻 国内国际要闻 晨会摘要",
+    });
+
+    expect(result.provider).toBe("bing-rss");
+    expect(result.queryUsed).toBeTruthy();
+    expect(result.results).toHaveLength(2);
+    expect(result.results.map((item) => item.domain)).toEqual([
+      "reuters.com",
+      "apnews.com",
+    ]);
+  });
+
+  it("preserves an explicit historical year when latest-news queries include a real topic", async () => {
+    process.env.SEARCH_PROVIDERS = "bing-rss";
+
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const query = decodeURIComponent(url.match(/[?&]q=([^&]+)/)?.[1] ?? "");
+
+      expect(query).toBe("2024年 OpenAI 最新新闻");
+
+      return new Response(
+        `<?xml version="1.0"?><rss><channel>
+          <item><title>OpenAI in 2024</title><link>https://www.reuters.com/technology/openai-2024</link><description>OpenAI developments in 2024</description></item>
+        </channel></rss>`,
+        {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml" },
+        },
+      );
+    });
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { searchWeb } = await import("./tools");
+    const result = await searchWeb({ query: "2024年 OpenAI 最新新闻" });
+
+    expect(
+      fetchSpy.mock.calls.some(([input]) =>
+        decodeURIComponent(String(input).match(/[?&]q=([^&]+)/)?.[1] ?? "") ===
+        "2024年 OpenAI 最新新闻",
+      ),
+    ).toBe(true);
+    expect(result.queryUsed).toBe("2024年 OpenAI 最新新闻");
+    expect(result.results).toHaveLength(1);
+  });
 });
