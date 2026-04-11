@@ -9,6 +9,7 @@ import {
   searchWeb,
 } from "@/lib/agent/tools";
 import type {
+  AgentRunTrace,
   AgentState,
   AgentRunTaskCategory,
   AgentStreamEvent,
@@ -16,7 +17,9 @@ import type {
   FetchedPage,
   LLMProvider,
   ModelFinishReason,
+  QueryRewriteResult,
   RetrievalDocument,
+  RetrievalRoute,
   RetrievalStep,
   SearchResult,
   ToolCall,
@@ -31,7 +34,7 @@ type RuntimeDependencies = {
   weatherLookup: typeof lookupWeather;
 };
 
-type RouteTarget = "web" | "knowledge-base" | "weather" | "none";
+type RouteTarget = RetrievalRoute;
 
 const SEARCH_SIGNALS = [
   "最新",
@@ -287,6 +290,14 @@ const makeStep = (
   metadata,
 });
 
+const toTraceDocuments = (documents: RetrievalDocument[]) =>
+  documents.map((document) => ({
+    id: document.id,
+    title: document.title,
+    source: document.source,
+    score: document.scores.final,
+  }));
+
 const isUsableWebResult = (result: SearchResult) => {
   const signals = result.rankingSignals ?? [];
   if (signals.includes("community-pattern")) {
@@ -474,6 +485,7 @@ export const runAgentTurn = async ({
   const retrievalDocuments: RetrievalDocument[] = [];
   let assistantText = "";
   let routed: RouteTarget = "none";
+  let runTrace: AgentRunTrace | undefined;
 
   const abortedState = (): AgentState => ({
     sessionId,
@@ -486,6 +498,7 @@ export const runAgentTurn = async ({
     taskCategory,
     status: "aborted",
     assistantText,
+    trace: runTrace,
   });
 
   try {
@@ -548,6 +561,10 @@ export const runAgentTurn = async ({
         taskCategory,
       }),
     ];
+
+    const emitRagStep = (step: RetrievalStep) => {
+      emit({ type: "rag_step", step });
+    };
 
     const runWebSearch = async (
       decision: { status: "call"; query: string; reason: string },
@@ -723,20 +740,79 @@ export const runAgentTurn = async ({
     if (routed === "knowledge-base") {
       const kbCall = createToolCall("knowledgeBaseSearch", "search", { query: userMessage });
       emit({ type: "tool_started", toolCall: kbCall });
+      emitRagStep(
+        makeStep(
+          "routing",
+          "Routing",
+          "Selected knowledge-base retrieval for this turn.",
+          {
+            route: routed,
+            taskCategory,
+          },
+        ),
+      );
+      emitRagStep(
+        makeStep("searching", "Searching", "Searching the knowledge base for relevant documents.", {
+          query: userMessage,
+        }),
+      );
+
+      const knowledgeTrace: RetrievalStep[] = [...trace];
+      let rewriteResult: QueryRewriteResult | undefined;
 
       const kbResponse = await knowledgeBaseSearch({
         query: userMessage,
         signal,
-        onProgress: (progress) =>
+        onProgress: (progress) => {
           emit({
             type: "tool_progress",
             progress: { ...progress, callId: kbCall.id },
-          }),
+          });
+
+          if (progress.message === "Running hybrid retrieval (sparse + dense)") {
+            emitRagStep(
+              makeStep(
+                "searching",
+                "Searching",
+                "Running hybrid retrieval across the internal knowledge base.",
+              ),
+            );
+          }
+
+          if (progress.message === "Hybrid retrieval degraded to dense-only retrieval") {
+            emitRagStep(
+              makeStep(
+                "searching",
+                "Searching",
+                "Hybrid retrieval is unavailable, falling back to dense-only retrieval.",
+              ),
+            );
+          }
+
+          if (progress.message === "Calling Jina rerank") {
+            emitRagStep(
+              makeStep(
+                "reranking",
+                "Reranking",
+                "Refining the retrieved documents with the reranker.",
+              ),
+            );
+          }
+
+          if (progress.message === "Jina rerank failed, keeping the local hybrid ranking") {
+            emitRagStep(
+              makeStep(
+                "reranking",
+                "Reranking",
+                "Reranking was unavailable, so the local ranking was kept.",
+              ),
+            );
+          }
+        },
       });
 
       retrievalDocuments.push(...kbResponse.documents);
-      const kbTrace = [
-        ...trace,
+      knowledgeTrace.push(
         makeStep(
           "searching",
           "Searching",
@@ -745,10 +821,24 @@ export const runAgentTurn = async ({
             strategy: kbResponse.strategy,
           },
         ),
+      );
+      emitRagStep(
+        makeStep(
+          "searching",
+          "Searching",
+          `Retrieved ${kbResponse.documents.length} candidate document(s) from the knowledge base.`,
+          {
+            strategy: kbResponse.strategy,
+            candidates: kbResponse.documents.length,
+          },
+        ),
+      );
+
+      knowledgeTrace.push(
         kbResponse.reranked
           ? makeStep("reranking", "Reranking", "Jina API reranking completed.")
           : makeStep("reranking", "Reranking", "Jina reranking unavailable, using local ranking instead."),
-      ];
+      );
 
       const gradeCall = createToolCall("knowledgeBaseSearch", "grade", {
         query: userMessage,
@@ -764,6 +854,13 @@ export const runAgentTurn = async ({
           detail: "Checking whether the retrieved documents are sufficient to answer.",
         },
       });
+      emitRagStep(
+        makeStep(
+          "grading",
+          "Grading",
+          "Checking whether the retrieved documents are sufficient to answer the question.",
+        ),
+      );
 
       let grade = assessKnowledgeBaseRetrieval({
         query: userMessage,
@@ -772,7 +869,7 @@ export const runAgentTurn = async ({
 
       let rewrittenQuery = userMessage;
       let rewrittenDocs = kbResponse.documents;
-      const rewriteTrace = [...kbTrace];
+      const rewriteTrace = [...knowledgeTrace];
 
       if (grade.decision === "rewrite") {
         const strategy = chooseRewriteStrategy(0);
@@ -790,6 +887,24 @@ export const runAgentTurn = async ({
             detail: "Rewriting the knowledge-base query because the retrieved documents are weak.",
           },
         });
+        emitRagStep(
+          makeStep(
+            "grading",
+            "Grading",
+            "The first retrieval was too weak, so the query will be rewritten before searching again.",
+            {
+              decision: grade.decision,
+              reason: grade.reason,
+            },
+          ),
+        );
+        emitRagStep(
+          makeStep(
+            "rewriting",
+            "Rewriting",
+            `Rewriting the knowledge-base query with the ${strategy} strategy.`,
+          ),
+        );
 
         const rewrite = await provider.rewriteQuery({
           userMessage,
@@ -797,12 +912,29 @@ export const runAgentTurn = async ({
           strategyHint: strategy,
           signal,
         });
+        rewriteResult = rewrite;
         rewrittenQuery = rewrite.query;
         rewriteTrace.push(
           makeStep("rewriting", "Rewriting", rewrite.reason, {
             mode: rewrite.mode,
             query: rewrite.query,
           }),
+        );
+        emitRagStep(
+          makeStep("rewriting", "Rewriting", rewrite.reason, {
+            mode: rewrite.mode,
+            query: rewrite.query,
+          }),
+        );
+        emitRagStep(
+          makeStep(
+            "searching",
+            "Searching",
+            "Searching the knowledge base again with the rewritten query.",
+            {
+              query: rewrittenQuery,
+            },
+          ),
         );
 
         const rewrittenResponse = await knowledgeBaseSearch({
@@ -811,11 +943,47 @@ export const runAgentTurn = async ({
         });
         rewrittenDocs = rewrittenResponse.documents;
         retrievalDocuments.splice(0, retrievalDocuments.length, ...rewrittenDocs);
+        rewriteTrace.push(
+          makeStep(
+            "searching",
+            "Searching",
+            `Expanded retrieval returned ${rewrittenDocs.length} candidate(s).`,
+            {
+              strategy: rewrittenResponse.strategy,
+              candidates: rewrittenDocs.length,
+            },
+          ),
+        );
+        emitRagStep(
+          makeStep(
+            "searching",
+            "Searching",
+            `Expanded retrieval returned ${rewrittenDocs.length} candidate document(s).`,
+            {
+              strategy: rewrittenResponse.strategy,
+              candidates: rewrittenDocs.length,
+            },
+          ),
+        );
         grade = assessKnowledgeBaseRetrieval({
           query: userMessage,
           documents: rewrittenDocs,
         });
       }
+
+      emitRagStep(
+        makeStep(
+          "grading",
+          "Grading",
+          grade.decision === "answer"
+            ? "The retrieved documents are strong enough to answer directly."
+            : "The retrieved documents are still weak, so the assistant will answer conservatively.",
+          {
+            decision: grade.decision,
+            reason: grade.reason,
+          },
+        ),
+      );
 
       const kbResult: ToolResult = {
         callId: kbCall.id,
@@ -852,6 +1020,16 @@ export const runAgentTurn = async ({
       };
       toolResults.push(kbResult);
       emit({ type: "tool_result", toolResult: kbResult });
+      runTrace = {
+        route: routed,
+        originalQuery: userMessage,
+        finalQuery: rewrittenQuery,
+        searchStrategy: kbResponse.strategy,
+        grading: grade,
+        rewrite: rewriteResult,
+        retrievedDocuments: toTraceDocuments(rewrittenDocs),
+        steps: kbResult.trace ?? [],
+      };
 
       if (shouldSupplementKnowledgeWithWeb(userMessage)) {
         const decision = await provider.decideWebSearchToolCall({
@@ -952,6 +1130,7 @@ export const runAgentTurn = async ({
       taskCategory,
       status: "completed",
       assistantText,
+      trace: runTrace,
     };
   } catch (error) {
     if (isAbortError(error, signal)) {
@@ -1031,6 +1210,7 @@ export const runAgentTurn = async ({
         taskCategory,
         status: "completed",
         assistantText,
+        trace: runTrace,
       };
     }
 

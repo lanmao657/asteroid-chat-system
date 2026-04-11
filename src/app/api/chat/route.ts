@@ -46,6 +46,7 @@ const createStreamHeaders = () => ({
   "Cache-Control": "no-cache, no-transform",
   Connection: "keep-alive",
   "X-Content-Type-Options": "nosniff",
+  "X-Accel-Buffering": "no",
 });
 
 export const runtime = "nodejs";
@@ -146,8 +147,12 @@ export async function POST(request: Request) {
         }
 
         if (result.status === "completed") {
+          if (result.trace) {
+            emit({ type: "trace", trace: result.trace });
+          }
           const assistantMessage = toMessage("assistant", result.assistantText, {
             runId: result.runId,
+            trace: result.trace,
           });
           appendSessionMessage(payload.sessionId, assistantMessage);
           emit({ type: "assistant_final", message: assistantMessage });

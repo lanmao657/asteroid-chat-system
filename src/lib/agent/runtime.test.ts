@@ -132,6 +132,7 @@ describe("runAgentTurn", () => {
     expect(events.map((event) => event.type)).toContain("tool_started");
     expect(events.map((event) => event.type)).toContain("tool_progress");
     expect(events.map((event) => event.type)).toContain("tool_result");
+    expect(events.map((event) => event.type)).toContain("rag_step");
     const toolResultEvent = events.find(
       (event) =>
         event.type === "tool_result" &&
@@ -143,6 +144,11 @@ describe("runAgentTurn", () => {
       expect(detail.decisionSource).toBe("retrieval-heuristic");
       expect(detail.coverageRatio).toBeGreaterThan(0);
     }
+    const ragStepLabels = events
+      .filter((event): event is Extract<AgentStreamEvent, { type: "rag_step" }> => event.type === "rag_step")
+      .map((event) => event.step.label);
+    expect(ragStepLabels).toContain("Searching");
+    expect(ragStepLabels).toContain("Grading");
   });
 
   it("triggers a rewrite when knowledge-base retrieval is weak", async () => {
@@ -203,6 +209,12 @@ describe("runAgentTurn", () => {
         (event) =>
           event.type === "tool_progress" &&
           event.progress.message === "Rewriting -> step-back",
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "rag_step" && event.step.stage === "rewriting",
       ),
     ).toBe(true);
   });

@@ -167,6 +167,24 @@ export interface RetrievalStep {
   metadata?: Record<string, unknown>;
 }
 
+export type RetrievalRoute = "web" | "knowledge-base" | "weather" | "none";
+
+export interface AgentRunTrace {
+  route: RetrievalRoute;
+  originalQuery: string;
+  finalQuery: string;
+  searchStrategy?: "hybrid" | "dense-only";
+  grading?: KnowledgeBaseRetrievalAssessment;
+  rewrite?: QueryRewriteResult;
+  retrievedDocuments: Array<{
+    id: string;
+    title: string;
+    source: string;
+    score: number;
+  }>;
+  steps: RetrievalStep[];
+}
+
 export interface ToolResult {
   callId: string;
   tool: ToolName;
@@ -194,6 +212,7 @@ export interface AgentState {
   taskCategory: AgentRunTaskCategory;
   status: "running" | "completed" | "aborted" | "errored";
   assistantText: string;
+  trace?: AgentRunTrace;
 }
 
 export type AgentRunTaskCategory =
@@ -285,6 +304,14 @@ export type AgentStreamEvent =
   | {
       type: "tool_result";
       toolResult: ToolResult;
+    }
+  | {
+      type: "rag_step";
+      step: RetrievalStep;
+    }
+  | {
+      type: "trace";
+      trace: AgentRunTrace;
     }
   | {
       type: "assistant_started";

@@ -491,14 +491,6 @@
   margin-right: auto;
 }
 
-.message[data-role="assistant"] .messageBodyMarkdown,
-.message[data-role="assistant"] .messageBody {
-  padding: 18px 20px;
-  border-radius: 22px;
-  background: rgba(255, 255, 255, 0.76);
-  border: 1px solid rgba(17, 17, 17, 0.05);
-}
-
 .message[data-role="user"] {
   margin-left: auto;
   max-width: 820px;
@@ -522,6 +514,40 @@
   font-size: 0.77rem;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+.assistantBubble {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px 18px;
+  border-radius: 24px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.72)),
+    rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(17, 17, 17, 0.05);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.82),
+    0 12px 26px rgba(17, 17, 17, 0.05);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    background 180ms ease;
+}
+
+.assistantBubble[data-phase="thinking"] {
+  border-color: rgba(17, 17, 17, 0.08);
+}
+
+.assistantBubble[data-phase="responding"] {
+  gap: 12px;
+}
+
+.assistantBubble .messageBodyMarkdown,
+.assistantBubble .messageBody {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .messageBody {
@@ -609,6 +635,12 @@
 .thinkingBlock {
   display: grid;
   gap: 10px;
+  transition: gap 180ms ease;
+}
+
+.thinkingBlock[data-phase="responding"],
+.thinkingBlock[data-phase="complete"] {
+  gap: 8px;
 }
 
 .thinkingToggle {
@@ -620,18 +652,26 @@
   padding: 12px 14px;
   border: 1px solid rgba(17, 17, 17, 0.08);
   border-radius: 18px;
-  background: rgba(255, 255, 255, 0.62);
+  background: rgba(247, 247, 243, 0.84);
   color: var(--ink-strong);
   text-align: left;
   cursor: pointer;
   transition:
     border-color 160ms ease,
-    background 160ms ease;
+    background 160ms ease,
+    transform 160ms ease;
+}
+
+.thinkingToggle[data-phase="responding"],
+.thinkingToggle[data-phase="complete"] {
+  padding-block: 10px;
+  background: rgba(248, 248, 244, 0.68);
 }
 
 .thinkingToggle:hover {
   border-color: rgba(17, 17, 17, 0.14);
-  background: rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.92);
+  transform: translateY(-1px);
 }
 
 .thinkingToggleIcon {
@@ -645,10 +685,21 @@
   color: var(--ink-soft);
 }
 
+.thinkingToggleIcon[data-phase="thinking"] {
+  background: rgba(17, 17, 17, 0.08);
+}
+
 .thinkingToggleBody {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 4px;
+}
+
+.thinkingToggleHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .thinkingToggleTitle {
@@ -657,10 +708,58 @@
   line-height: 1.35;
 }
 
+.thinkingStatusPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(17, 17, 17, 0.05);
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.thinkingStatusPill[data-phase="thinking"] {
+  background: rgba(17, 17, 17, 0.08);
+  color: var(--ink-strong);
+}
+
+.thinkingStatusPill[data-phase="stopped"] {
+  background: rgba(17, 17, 17, 0.06);
+}
+
+.thinkingStatusDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(17, 17, 17, 0.36);
+}
+
+.thinkingStatusDot[data-phase="thinking"] {
+  background: #111111;
+  animation: thinkingPulse 1.3s ease-in-out infinite;
+}
+
+.thinkingStatusDot[data-phase="responding"] {
+  background: rgba(17, 17, 17, 0.72);
+}
+
+.thinkingStatusDot[data-phase="stopped"] {
+  background: rgba(17, 17, 17, 0.42);
+}
+
 .thinkingToggleSummary {
   color: var(--ink-soft);
   font-size: 0.82rem;
   line-height: 1.45;
+}
+
+.thinkingTraceMeta {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 .thinkingToggleChevron {
@@ -685,6 +784,13 @@
   border-radius: 18px;
   border: 1px solid rgba(17, 17, 17, 0.06);
   background: rgba(255, 255, 255, 0.58);
+  animation: thinkingItemReveal 220ms ease;
+}
+
+.thinkingItem[data-current="true"] {
+  border-color: rgba(17, 17, 17, 0.12);
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
 }
 
 .thinkingItemMeta {
@@ -712,6 +818,13 @@
   color: var(--ink-soft);
   font-size: 0.78rem;
   line-height: 1.55;
+}
+
+.streamingStoppedNote {
+  padding: 2px 0 0;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  line-height: 1.6;
 }
 
 .composerDock {
@@ -968,6 +1081,11 @@
     padding: 22px 18px 26px;
   }
 
+  .assistantBubble {
+    padding: 14px 14px 16px;
+    border-radius: 20px;
+  }
+
   .emptyState {
     padding: 28px 20px;
   }
@@ -983,5 +1101,30 @@
 
   .sendButton {
     width: 100%;
+  }
+}
+
+@keyframes thinkingPulse {
+  0%,
+  100% {
+    transform: scale(0.9);
+    opacity: 0.55;
+  }
+
+  50% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+}
+
+@keyframes thinkingItemReveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }

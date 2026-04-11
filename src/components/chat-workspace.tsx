@@ -30,7 +30,7 @@ import {
   formatToolStartedTitle,
   localizeTraceText,
 } from "@/lib/agent/trace-presentation";
-import type { AgentStreamEvent, ChatMessage } from "@/lib/agent/types";
+import type { AgentRunTrace, AgentStreamEvent, ChatMessage, RetrievalStep } from "@/lib/agent/types";
 
 interface ActiveRunState {
   sessionId: string;
@@ -117,6 +117,7 @@ const createThoughtDraft = (current?: StreamingDraft): StreamingDraft => ({
   content: current?.content ?? "",
   status: current?.status ?? "streaming",
   createdAt: current?.createdAt ?? new Date().toISOString(),
+  trace: current?.trace,
   thoughts: current?.thoughts ?? [],
 });
 
@@ -169,8 +170,16 @@ const safeJson = (value: unknown) => {
   }
 };
 
-const attachThoughtsToMessage = (message: ChatMessage, thoughts: ActivityItem[]): ChatMessage => {
-  if (thoughts.length === 0) {
+const attachAssistantMetadataToMessage = ({
+  message,
+  thoughts,
+  trace,
+}: {
+  message: ChatMessage;
+  thoughts: ActivityItem[];
+  trace?: AgentRunTrace;
+}): ChatMessage => {
+  if (thoughts.length === 0 && !trace) {
     return message;
   }
 
@@ -179,8 +188,38 @@ const attachThoughtsToMessage = (message: ChatMessage, thoughts: ActivityItem[])
     metadata: {
       ...message.metadata,
       thoughts,
+      trace,
     },
   };
+};
+
+const createRagStepActivity = (step: RetrievalStep) =>
+  createActivity(
+    "run",
+    step.label,
+    step.detail,
+    step.metadata ? safeJson(step.metadata) : undefined,
+  );
+
+const isKnowledgeBaseToolEvent = (
+  event:
+    | Extract<AgentStreamEvent, { type: "tool_started" }>
+    | Extract<AgentStreamEvent, { type: "tool_progress" }>
+    | Extract<AgentStreamEvent, { type: "tool_result" }>,
+) => {
+  if (event.type === "tool_started") {
+    return event.toolCall.tool === "knowledgeBaseSearch" || event.toolCall.phase === "route";
+  }
+  if (event.type === "tool_progress") {
+    return (
+      event.progress.tool === "knowledgeBaseSearch" ||
+      event.progress.message.startsWith("Routing ->")
+    );
+  }
+  return (
+    event.toolResult.tool === "knowledgeBaseSearch" &&
+    event.toolResult.status !== "error"
+  );
 };
 
 export function ChatWorkspace() {
@@ -292,6 +331,16 @@ export function ChatWorkspace() {
     updateStreamingDraft(sessionId, (current) =>
       current ? { ...current, status: nextStatus } : current,
     );
+  };
+
+  const setStreamingDraftTrace = (sessionId: string, trace: AgentRunTrace) => {
+    updateStreamingDraft(sessionId, (current) => {
+      const draftState = createThoughtDraft(current);
+      return {
+        ...draftState,
+        trace,
+      };
+    });
   };
 
   const appendThought = (
@@ -481,6 +530,10 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "tool_started") {
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
       appendThought(
         sessionId,
         createActivity(
@@ -494,6 +547,10 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "tool_progress") {
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
       const progressMessage = formatToolProgressMessage(event.progress);
       appendThought(
         sessionId,
@@ -508,6 +565,10 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "tool_result") {
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
       const resultSummary = formatToolResultSummary(event.toolResult);
       appendThought(
         sessionId,
@@ -519,6 +580,17 @@ export function ChatWorkspace() {
         ),
       );
       setStatus(resultSummary);
+      return;
+    }
+
+    if (event.type === "rag_step") {
+      appendThought(sessionId, createRagStepActivity(event.step));
+      setStatus(event.step.label);
+      return;
+    }
+
+    if (event.type === "trace") {
+      setStreamingDraftTrace(sessionId, event.trace);
       return;
     }
 
@@ -553,7 +625,15 @@ export function ChatWorkspace() {
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
-        attachThoughtsToMessage(resolved.message, currentDraft?.thoughts ?? []),
+        attachAssistantMetadataToMessage({
+          message: resolved.message,
+          thoughts: currentDraft?.thoughts ?? [],
+          trace:
+            currentDraft?.trace ??
+            ((resolved.message.metadata as Record<string, unknown> | undefined)?.trace as
+              | AgentRunTrace
+              | undefined),
+        }),
       );
       setStatus("回答完成");
       return;
@@ -579,12 +659,13 @@ export function ChatWorkspace() {
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
-        attachThoughtsToMessage(
-          createLocalMessage("assistant", formatted, {
+        attachAssistantMetadataToMessage({
+          message: createLocalMessage("assistant", formatted, {
             kind: "system-error",
           }),
-          currentDraft?.thoughts ?? [],
-        ),
+          thoughts: currentDraft?.thoughts ?? [],
+          trace: currentDraft?.trace,
+        }),
       );
       setActiveRun(null);
       activeControllerRef.current = null;
@@ -673,12 +754,13 @@ export function ChatWorkspace() {
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
-        attachThoughtsToMessage(
-          createLocalMessage("assistant", message, {
+        attachAssistantMetadataToMessage({
+          message: createLocalMessage("assistant", message, {
             kind: "system-error",
           }),
-          currentDraft?.thoughts ?? [],
-        ),
+          thoughts: currentDraft?.thoughts ?? [],
+          trace: currentDraft?.trace,
+        }),
       );
       setActiveRun(null);
       activeControllerRef.current = null;
