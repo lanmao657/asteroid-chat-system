@@ -1,6 +1,7 @@
 import { agentEnv } from "@/lib/agent/env";
 import { createProvider } from "@/lib/agent/provider";
 import {
+  assessKnowledgeBaseRetrieval,
   SearchToolError,
   fetchWebPage,
   lookupWeather,
@@ -8,13 +9,17 @@ import {
   searchWeb,
 } from "@/lib/agent/tools";
 import type {
+  AgentRunTrace,
   AgentState,
+  AgentRunTaskCategory,
   AgentStreamEvent,
   ChatMessage,
   FetchedPage,
   LLMProvider,
   ModelFinishReason,
+  QueryRewriteResult,
   RetrievalDocument,
+  RetrievalRoute,
   RetrievalStep,
   SearchResult,
   ToolCall,
@@ -29,7 +34,7 @@ type RuntimeDependencies = {
   weatherLookup: typeof lookupWeather;
 };
 
-type RouteTarget = "web" | "knowledge-base" | "weather" | "none";
+type RouteTarget = RetrievalRoute;
 
 const SEARCH_SIGNALS = [
   "最新",
@@ -52,7 +57,54 @@ const SEARCH_SIGNALS = [
 ];
 
 const WEATHER_SIGNALS = ["天气", "气温", "下雨", "weather", "forecast", "temperature"];
-const KNOWLEDGE_SIGNALS = ["知识库", "文档", "内部", "产品", "企业", "设计", "knowledge base", "docs", "documentation", "kb"];
+const KNOWLEDGE_SIGNALS = [
+  "知识库",
+  "文档",
+  "内部",
+  "企业",
+  "制度",
+  "政策",
+  "流程",
+  "规范",
+  "sop",
+  "培训",
+  "入职",
+  "案例",
+  "复盘",
+  "报销",
+  "审批",
+  "客服话术",
+  "销售话术",
+  "faq",
+  "knowledge base",
+  "docs",
+  "documentation",
+  "kb",
+  "policy",
+  "process",
+  "onboarding",
+  "playbook",
+];
+const EXTERNAL_WEB_SUPPLEMENT_SIGNALS = [
+  "最新",
+  "最近",
+  "政策变化",
+  "行业",
+  "监管",
+  "法规",
+  "竞品",
+  "市场",
+  "新闻",
+  "外部",
+  "latest",
+  "recent",
+  "policy change",
+  "industry",
+  "regulation",
+  "competitor",
+  "market",
+  "news",
+];
 
 const isAbortError = (error: unknown, signal?: AbortSignal) =>
   signal?.aborted ||
@@ -89,6 +141,51 @@ const isWeatherQuery = (value: string) => {
 const isKnowledgeQuery = (value: string) => {
   const normalized = value.toLowerCase();
   return KNOWLEDGE_SIGNALS.some((signal) => normalized.includes(signal.toLowerCase()));
+};
+
+const shouldSupplementKnowledgeWithWeb = (value: string) => {
+  const normalized = value.toLowerCase();
+  return EXTERNAL_WEB_SUPPLEMENT_SIGNALS.some((signal) =>
+    normalized.includes(signal.toLowerCase()),
+  );
+};
+
+const inferTaskCategory = (userMessage: string): AgentRunTaskCategory => {
+  const normalized = userMessage.toLowerCase();
+
+  if (
+    ["培训", "入职", "学习清单", "培训手册", "培训资料", "培训课件", "onboarding", "training"].some(
+      (signal) => normalized.includes(signal.toLowerCase()),
+    )
+  ) {
+    return "training_summary";
+  }
+
+  if (
+    ["制度", "政策", "报销", "审批", "合规", "规范", "policy", "reimbursement"].some((signal) =>
+      normalized.includes(signal.toLowerCase()),
+    )
+  ) {
+    return "policy_qa";
+  }
+
+  if (
+    ["sop", "流程", "步骤", "怎么走", "如何操作", "退款", "客服话术", "销售话术", "faq"].some(
+      (signal) => normalized.includes(signal.toLowerCase()),
+    )
+  ) {
+    return "sop_lookup";
+  }
+
+  if (
+    ["复盘", "案例", "经验教训", "回顾", "postmortem", "case review", "retro"].some((signal) =>
+      normalized.includes(signal.toLowerCase()),
+    )
+  ) {
+    return "case_review";
+  }
+
+  return "general";
 };
 
 const cleanWeatherLocationCandidate = (value: string) =>
@@ -192,6 +289,14 @@ const makeStep = (
   detail,
   metadata,
 });
+
+const toTraceDocuments = (documents: RetrievalDocument[]) =>
+  documents.map((document) => ({
+    id: document.id,
+    title: document.title,
+    source: document.source,
+    score: document.scores.final,
+  }));
 
 const isUsableWebResult = (result: SearchResult) => {
   const signals = result.rankingSignals ?? [];
@@ -363,6 +468,7 @@ export const runAgentTurn = async ({
   const knowledgeBaseSearch = dependencies?.searchKnowledgeBase ?? searchKnowledgeBase;
   const weatherLookup = dependencies?.weatherLookup ?? lookupWeather;
   const runId = crypto.randomUUID();
+  const taskCategory = inferTaskCategory(userMessage);
 
   emit({ type: "run_started", runId, sessionId });
   emit({
@@ -379,6 +485,7 @@ export const runAgentTurn = async ({
   const retrievalDocuments: RetrievalDocument[] = [];
   let assistantText = "";
   let routed: RouteTarget = "none";
+  let runTrace: AgentRunTrace | undefined;
 
   const abortedState = (): AgentState => ({
     sessionId,
@@ -388,8 +495,10 @@ export const runAgentTurn = async ({
     recentConversation,
     memorySummary: nextMemorySummary,
     toolResults,
+    taskCategory,
     status: "aborted",
     assistantText,
+    trace: runTrace,
   });
 
   try {
@@ -449,8 +558,138 @@ export const runAgentTurn = async ({
     const trace: RetrievalStep[] = [
       makeStep("routing", "Routing", `Selected ${routed} route for this turn.`, {
         route: routed,
+        taskCategory,
       }),
     ];
+
+    const emitRagStep = (step: RetrievalStep) => {
+      emit({ type: "rag_step", step });
+    };
+
+    const runWebSearch = async (
+      decision: { status: "call"; query: string; reason: string },
+      reasonLabel: "requested" | "supplemental",
+    ) => {
+      const searchCall = createToolCall("searchWeb", "search", {
+        query: decision.query,
+        requestedByModel: true,
+        mode: reasonLabel,
+      });
+      emit({ type: "tool_started", toolCall: searchCall });
+      emit({
+        type: "tool_progress",
+        progress: {
+          callId: searchCall.id,
+          tool: "searchWeb",
+          message:
+            reasonLabel === "supplemental"
+              ? "Searching -> 外部补充"
+              : "Searching -> web_search",
+          detail: decision.query,
+        },
+      });
+
+      const response = await search({
+        query: decision.query,
+        signal,
+        onProgress: (progress) =>
+          emit({
+            type: "tool_progress",
+            progress: { ...progress, callId: searchCall.id },
+          }),
+      });
+
+      const usableResults = response.results.filter((result) => isUsableWebResult(result));
+      searchResults.splice(0, searchResults.length, ...usableResults);
+      pageContents.splice(0, pageContents.length);
+
+      for (const [index, result] of usableResults.slice(0, agentEnv.fetchMaxPages).entries()) {
+        const fetchCall = createToolCall("fetchWebPage", "fetch", { url: result.url });
+        emit({ type: "tool_started", toolCall: fetchCall });
+        emit({
+          type: "tool_progress",
+          progress: {
+            callId: fetchCall.id,
+            tool: "fetchWebPage",
+            message: `Fetching -> ${index + 1}/${Math.min(
+              response.results.length,
+              usableResults.length,
+              agentEnv.fetchMaxPages,
+            )}`,
+            detail: result.url,
+          },
+        });
+
+        try {
+          const page = await fetchPage({ url: result.url, signal });
+          pageContents.push(page);
+          result.fetchStatus = "fetched";
+        } catch (error) {
+          if (isAbortError(error, signal)) {
+            emit({
+              type: "assistant_aborted",
+              runId,
+              message: "Current answer was aborted.",
+            });
+            return abortedState();
+          }
+          result.fetchStatus = "failed";
+        }
+      }
+
+      const externalDocuments = toRetrievalDocumentsFromSearch(usableResults, pageContents);
+      if (reasonLabel === "supplemental") {
+        retrievalDocuments.push(...externalDocuments);
+      } else {
+        retrievalDocuments.splice(0, retrievalDocuments.length, ...externalDocuments);
+      }
+
+      const summary =
+        usableResults.length > 0
+          ? reasonLabel === "supplemental"
+            ? `External web research added ${usableResults.length} usable result(s) for policy or industry context.`
+            : `Web search completed with ${usableResults.length} usable result(s).`
+          : "Live web search was attempted, but current providers did not return enough reliable results.";
+
+      const webResult: ToolResult = {
+        callId: searchCall.id,
+        tool: "searchWeb",
+        phase: "search",
+        status: usableResults.length > 0 ? "success" : "empty",
+        summary,
+        payload: usableResults,
+        provider: response.provider,
+        keptCount: usableResults.length,
+        filteredCount: response.filteredResults.length,
+        detail: JSON.stringify({
+          queryUsed: response.queryUsed ?? decision.query,
+          decisionReason: decision.reason,
+          providerUsed: response.provider,
+          rawCount: response.rawCount ?? response.results.length + response.filteredResults.length,
+          normalizedCount:
+            response.normalizedCount ?? response.results.length + response.filteredResults.length,
+          keptCount: usableResults.length,
+          filteredCount: response.filteredResults.length,
+          filterReasons: response.filterReasons ?? {},
+          discardedCount: response.results.length - usableResults.length,
+          attempts: response.attempts ?? [],
+          mode: reasonLabel,
+        }),
+        trace: [
+          ...trace,
+          makeStep("searching", "Searching", summary, {
+            provider: response.provider,
+            query: response.queryUsed ?? decision.query,
+            mode: reasonLabel,
+          }),
+          makeStep("completed", "Completed", "web_search finished."),
+        ],
+      };
+      toolResults.push(webResult);
+      emit({ type: "tool_result", toolResult: webResult });
+
+      return null;
+    };
 
     if (routed === "weather") {
       const weatherCall = createToolCall("weatherLookup", "weather", { query: userMessage });
@@ -501,20 +740,79 @@ export const runAgentTurn = async ({
     if (routed === "knowledge-base") {
       const kbCall = createToolCall("knowledgeBaseSearch", "search", { query: userMessage });
       emit({ type: "tool_started", toolCall: kbCall });
+      emitRagStep(
+        makeStep(
+          "routing",
+          "Routing",
+          "Selected knowledge-base retrieval for this turn.",
+          {
+            route: routed,
+            taskCategory,
+          },
+        ),
+      );
+      emitRagStep(
+        makeStep("searching", "Searching", "Searching the knowledge base for relevant documents.", {
+          query: userMessage,
+        }),
+      );
+
+      const knowledgeTrace: RetrievalStep[] = [...trace];
+      let rewriteResult: QueryRewriteResult | undefined;
 
       const kbResponse = await knowledgeBaseSearch({
         query: userMessage,
         signal,
-        onProgress: (progress) =>
+        onProgress: (progress) => {
           emit({
             type: "tool_progress",
             progress: { ...progress, callId: kbCall.id },
-          }),
+          });
+
+          if (progress.message === "Running hybrid retrieval (sparse + dense)") {
+            emitRagStep(
+              makeStep(
+                "searching",
+                "Searching",
+                "Running hybrid retrieval across the internal knowledge base.",
+              ),
+            );
+          }
+
+          if (progress.message === "Hybrid retrieval degraded to dense-only retrieval") {
+            emitRagStep(
+              makeStep(
+                "searching",
+                "Searching",
+                "Hybrid retrieval is unavailable, falling back to dense-only retrieval.",
+              ),
+            );
+          }
+
+          if (progress.message === "Calling Jina rerank") {
+            emitRagStep(
+              makeStep(
+                "reranking",
+                "Reranking",
+                "Refining the retrieved documents with the reranker.",
+              ),
+            );
+          }
+
+          if (progress.message === "Jina rerank failed, keeping the local hybrid ranking") {
+            emitRagStep(
+              makeStep(
+                "reranking",
+                "Reranking",
+                "Reranking was unavailable, so the local ranking was kept.",
+              ),
+            );
+          }
+        },
       });
 
       retrievalDocuments.push(...kbResponse.documents);
-      const kbTrace = [
-        ...trace,
+      knowledgeTrace.push(
         makeStep(
           "searching",
           "Searching",
@@ -523,10 +821,24 @@ export const runAgentTurn = async ({
             strategy: kbResponse.strategy,
           },
         ),
+      );
+      emitRagStep(
+        makeStep(
+          "searching",
+          "Searching",
+          `Retrieved ${kbResponse.documents.length} candidate document(s) from the knowledge base.`,
+          {
+            strategy: kbResponse.strategy,
+            candidates: kbResponse.documents.length,
+          },
+        ),
+      );
+
+      knowledgeTrace.push(
         kbResponse.reranked
           ? makeStep("reranking", "Reranking", "Jina API reranking completed.")
           : makeStep("reranking", "Reranking", "Jina reranking unavailable, using local ranking instead."),
-      ];
+      );
 
       const gradeCall = createToolCall("knowledgeBaseSearch", "grade", {
         query: userMessage,
@@ -542,16 +854,22 @@ export const runAgentTurn = async ({
           detail: "Checking whether the retrieved documents are sufficient to answer.",
         },
       });
+      emitRagStep(
+        makeStep(
+          "grading",
+          "Grading",
+          "Checking whether the retrieved documents are sufficient to answer the question.",
+        ),
+      );
 
-      let grade = await provider.gradeDocuments({
-        userMessage,
-        retrievalContext: kbResponse.documents,
-        signal,
+      let grade = assessKnowledgeBaseRetrieval({
+        query: userMessage,
+        documents: kbResponse.documents,
       });
 
       let rewrittenQuery = userMessage;
       let rewrittenDocs = kbResponse.documents;
-      const rewriteTrace = [...kbTrace];
+      const rewriteTrace = [...knowledgeTrace];
 
       if (grade.decision === "rewrite") {
         const strategy = chooseRewriteStrategy(0);
@@ -569,6 +887,24 @@ export const runAgentTurn = async ({
             detail: "Rewriting the knowledge-base query because the retrieved documents are weak.",
           },
         });
+        emitRagStep(
+          makeStep(
+            "grading",
+            "Grading",
+            "The first retrieval was too weak, so the query will be rewritten before searching again.",
+            {
+              decision: grade.decision,
+              reason: grade.reason,
+            },
+          ),
+        );
+        emitRagStep(
+          makeStep(
+            "rewriting",
+            "Rewriting",
+            `Rewriting the knowledge-base query with the ${strategy} strategy.`,
+          ),
+        );
 
         const rewrite = await provider.rewriteQuery({
           userMessage,
@@ -576,12 +912,29 @@ export const runAgentTurn = async ({
           strategyHint: strategy,
           signal,
         });
+        rewriteResult = rewrite;
         rewrittenQuery = rewrite.query;
         rewriteTrace.push(
           makeStep("rewriting", "Rewriting", rewrite.reason, {
             mode: rewrite.mode,
             query: rewrite.query,
           }),
+        );
+        emitRagStep(
+          makeStep("rewriting", "Rewriting", rewrite.reason, {
+            mode: rewrite.mode,
+            query: rewrite.query,
+          }),
+        );
+        emitRagStep(
+          makeStep(
+            "searching",
+            "Searching",
+            "Searching the knowledge base again with the rewritten query.",
+            {
+              query: rewrittenQuery,
+            },
+          ),
         );
 
         const rewrittenResponse = await knowledgeBaseSearch({
@@ -590,12 +943,47 @@ export const runAgentTurn = async ({
         });
         rewrittenDocs = rewrittenResponse.documents;
         retrievalDocuments.splice(0, retrievalDocuments.length, ...rewrittenDocs);
-        grade = await provider.gradeDocuments({
-          userMessage,
-          retrievalContext: rewrittenDocs,
-          signal,
+        rewriteTrace.push(
+          makeStep(
+            "searching",
+            "Searching",
+            `Expanded retrieval returned ${rewrittenDocs.length} candidate(s).`,
+            {
+              strategy: rewrittenResponse.strategy,
+              candidates: rewrittenDocs.length,
+            },
+          ),
+        );
+        emitRagStep(
+          makeStep(
+            "searching",
+            "Searching",
+            `Expanded retrieval returned ${rewrittenDocs.length} candidate document(s).`,
+            {
+              strategy: rewrittenResponse.strategy,
+              candidates: rewrittenDocs.length,
+            },
+          ),
+        );
+        grade = assessKnowledgeBaseRetrieval({
+          query: userMessage,
+          documents: rewrittenDocs,
         });
       }
+
+      emitRagStep(
+        makeStep(
+          "grading",
+          "Grading",
+          grade.decision === "answer"
+            ? "The retrieved documents are strong enough to answer directly."
+            : "The retrieved documents are still weak, so the assistant will answer conservatively.",
+          {
+            decision: grade.decision,
+            reason: grade.reason,
+          },
+        ),
+      );
 
       const kbResult: ToolResult = {
         callId: kbCall.id,
@@ -607,14 +995,24 @@ export const runAgentTurn = async ({
         provider: "knowledge-base",
         keptCount: rewrittenDocs.length,
         detail: JSON.stringify({
-          averageScore: grade.averageScore,
+          decisionSource: grade.decisionSource,
+          queryTerms: grade.queryTerms,
+          topDocument: grade.topDocument,
+          coverageRatio: grade.coverageRatio,
+          relevantDocumentCount: grade.relevantDocumentCount,
+          topGap: grade.topGap,
           reason: grade.reason,
           queryUsed: rewrittenQuery,
         }),
         trace: [
           ...rewriteTrace,
           makeStep("grading", "Grading", grade.reason, {
-            averageScore: grade.averageScore,
+            decisionSource: grade.decisionSource,
+            queryTerms: grade.queryTerms,
+            topDocument: grade.topDocument,
+            coverageRatio: grade.coverageRatio,
+            relevantDocumentCount: grade.relevantDocumentCount,
+            topGap: grade.topGap,
             decision: grade.decision,
           }),
           makeStep("completed", "Completed", "Knowledge-base retrieval finished."),
@@ -622,6 +1020,39 @@ export const runAgentTurn = async ({
       };
       toolResults.push(kbResult);
       emit({ type: "tool_result", toolResult: kbResult });
+      runTrace = {
+        route: routed,
+        originalQuery: userMessage,
+        finalQuery: rewrittenQuery,
+        searchStrategy: kbResponse.strategy,
+        grading: grade,
+        rewrite: rewriteResult,
+        retrievedDocuments: toTraceDocuments(rewrittenDocs),
+        steps: kbResult.trace ?? [],
+      };
+
+      if (shouldSupplementKnowledgeWithWeb(userMessage)) {
+        const decision = await provider.decideWebSearchToolCall({
+          userMessage,
+          recentConversation,
+          memorySummary: nextMemorySummary,
+          signal,
+        });
+
+        if (decision.status === "call" && decision.query) {
+          const aborted = await runWebSearch(
+            {
+              status: "call",
+              query: decision.query,
+              reason: decision.reason,
+            },
+            "supplemental",
+          );
+          if (aborted) {
+            return aborted;
+          }
+        }
+      }
     }
 
     if (routed === "web") {
@@ -654,116 +1085,17 @@ export const runAgentTurn = async ({
         toolResults.push(skippedResult);
         emit({ type: "tool_result", toolResult: skippedResult });
       } else {
-        const searchCall = createToolCall("searchWeb", "search", {
-          query: decision.query,
-          requestedByModel: true,
-        });
-        emit({ type: "tool_started", toolCall: searchCall });
-        emit({
-          type: "tool_progress",
-          progress: {
-            callId: searchCall.id,
-            tool: "searchWeb",
-            message: "Searching -> web_search",
-            detail: decision.query,
+        const aborted = await runWebSearch(
+          {
+            status: "call",
+            query: decision.query,
+            reason: decision.reason,
           },
-        });
-
-        const response = await search({
-          query: decision.query,
-          signal,
-          onProgress: (progress) =>
-            emit({
-              type: "tool_progress",
-              progress: { ...progress, callId: searchCall.id },
-            }),
-        });
-
-        const usableResults = response.results.filter((result) => isUsableWebResult(result));
-        searchResults.splice(0, searchResults.length, ...usableResults);
-        pageContents.splice(0, pageContents.length);
-
-        for (const [index, result] of usableResults
-          .slice(0, agentEnv.fetchMaxPages)
-          .entries()) {
-          const fetchCall = createToolCall("fetchWebPage", "fetch", { url: result.url });
-          emit({ type: "tool_started", toolCall: fetchCall });
-          emit({
-            type: "tool_progress",
-            progress: {
-              callId: fetchCall.id,
-              tool: "fetchWebPage",
-              message: `Fetching -> ${index + 1}/${Math.min(
-                response.results.length,
-                usableResults.length,
-                agentEnv.fetchMaxPages,
-              )}`,
-              detail: result.url,
-            },
-          });
-
-          try {
-            const page = await fetchPage({ url: result.url, signal });
-            pageContents.push(page);
-            result.fetchStatus = "fetched";
-          } catch (error) {
-            if (isAbortError(error, signal)) {
-              emit({
-                type: "assistant_aborted",
-                runId,
-                message: "Current answer was aborted.",
-              });
-              return abortedState();
-            }
-            result.fetchStatus = "failed";
-          }
-        }
-
-        retrievalDocuments.splice(
-          0,
-          retrievalDocuments.length,
-          ...toRetrievalDocumentsFromSearch(usableResults, pageContents),
+          "requested",
         );
-
-        const summary =
-          usableResults.length > 0
-            ? `Web search completed with ${usableResults.length} usable result(s).`
-            : "Live web search was attempted, but current providers did not return enough reliable results.";
-
-        const webResult: ToolResult = {
-          callId: searchCall.id,
-          tool: "searchWeb",
-          phase: "search",
-          status: usableResults.length > 0 ? "success" : "empty",
-          summary,
-          payload: usableResults,
-          provider: response.provider,
-          keptCount: usableResults.length,
-          filteredCount: response.filteredResults.length,
-          detail: JSON.stringify({
-            queryUsed: response.queryUsed ?? decision.query,
-            decisionReason: decision.reason,
-            providerUsed: response.provider,
-            rawCount: response.rawCount ?? response.results.length + response.filteredResults.length,
-            normalizedCount:
-              response.normalizedCount ?? response.results.length + response.filteredResults.length,
-            keptCount: usableResults.length,
-            filteredCount: response.filteredResults.length,
-            filterReasons: response.filterReasons ?? {},
-            discardedCount: response.results.length - usableResults.length,
-            attempts: response.attempts ?? [],
-          }),
-          trace: [
-            ...trace,
-            makeStep("searching", "Searching", summary, {
-              provider: response.provider,
-              query: response.queryUsed ?? decision.query,
-            }),
-            makeStep("completed", "Completed", "web_search finished."),
-          ],
-        };
-        toolResults.push(webResult);
-        emit({ type: "tool_result", toolResult: webResult });
+        if (aborted) {
+          return aborted;
+        }
       }
     }
 
@@ -795,8 +1127,10 @@ export const runAgentTurn = async ({
       recentConversation,
       memorySummary: nextMemorySummary,
       toolResults,
+      taskCategory,
       status: "completed",
       assistantText,
+      trace: runTrace,
     };
   } catch (error) {
     if (isAbortError(error, signal)) {
@@ -873,8 +1207,10 @@ export const runAgentTurn = async ({
         recentConversation,
         memorySummary: nextMemorySummary,
         toolResults,
+        taskCategory,
         status: "completed",
         assistantText,
+        trace: runTrace,
       };
     }
 

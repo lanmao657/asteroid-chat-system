@@ -26,12 +26,12 @@ export function ChatInputPanel({
   return (
     <section className={styles.composerDock}>
       <div className={styles.composerSurface}>
-        <div className={styles.composerPrompt}>Message Asteroid Chat</div>
+        <div className={styles.composerPrompt}>向北辰知识助手提问</div>
         <textarea
           className={styles.textarea}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="输入你的问题，例如：帮我解释一个 PostgreSQL 错误，或总结今天的重要新闻。"
+          placeholder="输入你的问题，例如：报销流程怎么走、根据客服 SOP 回答退款争议，或整理入职培训清单。"
           ref={textareaRef}
           rows={1}
           value={draft}

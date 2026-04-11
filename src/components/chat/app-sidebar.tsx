@@ -33,8 +33,8 @@ export function AppSidebar({
               <Sparkles size={16} strokeWidth={2.1} />
             </div>
             <div>
-              <div className={styles.logoTitle}>Asteroid Chat</div>
-              <div className={styles.logoSub}>Agent workspace for search, tools, and dialogue</div>
+              <div className={styles.logoTitle}>北辰知识助手</div>
+              <div className={styles.logoSub}>企业培训、制度问答与内部知识检索工作台</div>
             </div>
           </div>
 
@@ -60,7 +60,7 @@ export function AppSidebar({
       </div>
 
       <div className={styles.sidebarSection}>
-        <div className={styles.sidebarLabel}>Recent chats</div>
+        <div className={styles.sidebarLabel}>最近会话</div>
         <div className={styles.sessionList}>
           {sessions.map((session) => (
             <button
@@ -84,10 +84,10 @@ export function AppSidebar({
 
       <div className={styles.sidebarFooter}>
         <div className={styles.sidebarFooterCard}>
-          <div className={styles.sidebarFooterEyebrow}>Workspace</div>
-          <div className={styles.sidebarFooterTitle}>桌面端聊天首页</div>
+          <div className={styles.sidebarFooterEyebrow}>Enterprise</div>
+          <div className={styles.sidebarFooterTitle}>企业培训与内部知识助手</div>
           <div className={styles.sidebarFooterBody}>
-            保留现有 agent 链路，只升级桌面端的产品化界面体验。
+            优先围绕制度、流程、培训和案例来组织知识问答与复盘。
           </div>
         </div>
 
@@ -95,7 +95,7 @@ export function AppSidebar({
           <span className={styles.sidebarUtilityIcon}>
             <Settings2 size={15} />
           </span>
-          <span>设置入口预留</span>
+          <span>知识库与权限预留</span>
         </button>
       </div>
     </div>

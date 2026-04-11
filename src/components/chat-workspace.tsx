@@ -1,8 +1,14 @@
 "use client";
 
-import { startTransition, useDeferredValue, useEffect, useRef, useState } from "react";
+import {
+  startTransition,
+  useDeferredValue,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEventHandler,
+} from "react";
 
-import { ActivityPanel } from "@/components/chat/activity-panel";
 import { AppSidebar } from "@/components/chat/app-sidebar";
 import { ChatHeader } from "@/components/chat/chat-header";
 import { ChatInputPanel } from "@/components/chat/chat-input-panel";
@@ -16,7 +22,15 @@ import type {
 } from "@/components/chat/types";
 import { resolveAssistantFinalMessage } from "@/components/chat-stream";
 import styles from "@/components/chat-workspace.module.css";
-import type { AgentStreamEvent, ChatMessage, ToolResult } from "@/lib/agent/types";
+import {
+  formatToolProgressMessage,
+  formatToolResultDetail,
+  formatToolResultSummary,
+  formatToolResultTitle,
+  formatToolStartedTitle,
+  localizeTraceText,
+} from "@/lib/agent/trace-presentation";
+import type { AgentRunTrace, AgentStreamEvent, ChatMessage, RetrievalStep } from "@/lib/agent/types";
 
 interface ActiveRunState {
   sessionId: string;
@@ -24,36 +38,39 @@ interface ActiveRunState {
 }
 
 const INITIAL_PROMPT = "";
+const TEXTAREA_MAX_HEIGHT = 220;
+const AUTO_FOLLOW_THRESHOLD = 160;
+const MAX_THOUGHT_STEPS = 20;
 
 const PROMPT_SUGGESTIONS: PromptSuggestion[] = [
   {
-    id: "daily-news",
-    title: "总结今天的重要新闻",
-    prompt: "帮我总结今天的重要新闻，并整理成一段适合晨会同步的中文摘要。",
-    description: "快速拉一份适合团队同步的中文摘要。",
+    id: "expense-policy",
+    title: "查询报销制度",
+    prompt:
+      "新员工出差回来后报销流程怎么走？请按结论、适用范围、操作步骤、注意事项和来源说明回答。",
+    description: "验证制度问答和内部知识引用是否清晰。",
   },
   {
-    id: "singapore-weather",
-    title: "查看新加坡天气",
-    prompt: "帮我查一下新加坡今天的天气，并给出穿衣和出行建议。",
-    description: "适合验证天气工具和结构化回答效果。",
+    id: "onboarding-checklist",
+    title: "整理入职清单",
+    prompt: "请根据新员工培训手册整理一份前 30 天入职学习清单，按周拆分重点任务。",
+    description: "适合验证培训资料整理与行动项输出。",
   },
   {
-    id: "postgres-error",
-    title: "解释 PostgreSQL 错误",
-    prompt: "帮我解释一个 PostgreSQL 连接错误，并按排查优先级给出解决思路。",
-    description: "看看 Asteroid 如何处理技术排障类问题。",
+    id: "refund-sop",
+    title: "根据客服 SOP 回答",
+    prompt:
+      "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+    description: "检查 SOP 检索、步骤化回答和话术建议。",
   },
   {
-    id: "tech-search",
-    title: "搜索技术问题",
-    prompt: "帮我搜索一个前端性能问题，并整理成清晰的排查步骤和建议。",
-    description: "适合验证 web search 和工具链路的展示。",
+    id: "sales-brief",
+    title: "总结销售培训资料",
+    prompt:
+      "请总结新版产品卖点与销售话术指引，给业务同学一份简短的销售培训摘要。",
+    description: "适合验证 FAQ、培训资料和知识复用。",
   },
 ];
-
-const TEXTAREA_MAX_HEIGHT = 220;
-const AUTO_FOLLOW_THRESHOLD = 160;
 
 const formatTime = (value: string | number) =>
   new Intl.DateTimeFormat("zh-CN", {
@@ -95,6 +112,15 @@ const createActivity = (
   createdAt: new Date().toISOString(),
 });
 
+const createThoughtDraft = (current?: StreamingDraft): StreamingDraft => ({
+  id: current?.id ?? crypto.randomUUID(),
+  content: current?.content ?? "",
+  status: current?.status ?? "streaming",
+  createdAt: current?.createdAt ?? new Date().toISOString(),
+  trace: current?.trace,
+  thoughts: current?.thoughts ?? [],
+});
+
 const sessionTitleFrom = (message: string) => {
   const compact = message.trim().replace(/\s+/g, " ");
   return compact.length > 24 ? `${compact.slice(0, 24)}...` : compact || "新对话";
@@ -115,7 +141,7 @@ const formatErrorMessage = (message: string) => {
     return "上游模型限流（429），请稍后重试，或切换到更稳定的模型配置。";
   }
   if (message.includes("OpenAI-compatible API is not configured")) {
-    return "模型 API 尚未配置，请检查 .env.local 中的 API Key 和模型名称。";
+    return "模型 API 尚未配置，请检查 `.env.local` 中的 API Key 和模型名称。";
   }
   if (message.includes("Model response did not contain content")) {
     return "上游模型这次没有返回有效内容，请稍后重试。";
@@ -144,19 +170,56 @@ const safeJson = (value: unknown) => {
   }
 };
 
-const describeToolResult = (toolResult: ToolResult) => {
-  const provider = toolResult.provider ? ` · ${toolResult.provider}` : "";
-  return `${toolResult.tool}${provider} · ${toolResult.status}`;
+const attachAssistantMetadataToMessage = ({
+  message,
+  thoughts,
+  trace,
+}: {
+  message: ChatMessage;
+  thoughts: ActivityItem[];
+  trace?: AgentRunTrace;
+}): ChatMessage => {
+  if (thoughts.length === 0 && !trace) {
+    return message;
+  }
+
+  return {
+    ...message,
+    metadata: {
+      ...message.metadata,
+      thoughts,
+      trace,
+    },
+  };
 };
 
-const toolResultDetail = (toolResult: ToolResult) => {
-  if (toolResult.detail) {
-    return toolResult.detail;
+const createRagStepActivity = (step: RetrievalStep) =>
+  createActivity(
+    "run",
+    step.label,
+    step.detail,
+    step.metadata ? safeJson(step.metadata) : undefined,
+  );
+
+const isKnowledgeBaseToolEvent = (
+  event:
+    | Extract<AgentStreamEvent, { type: "tool_started" }>
+    | Extract<AgentStreamEvent, { type: "tool_progress" }>
+    | Extract<AgentStreamEvent, { type: "tool_result" }>,
+) => {
+  if (event.type === "tool_started") {
+    return event.toolCall.tool === "knowledgeBaseSearch" || event.toolCall.phase === "route";
   }
-  if (toolResult.trace && toolResult.trace.length > 0) {
-    return safeJson(toolResult.trace);
+  if (event.type === "tool_progress") {
+    return (
+      event.progress.tool === "knowledgeBaseSearch" ||
+      event.progress.message.startsWith("Routing ->")
+    );
   }
-  return "";
+  return (
+    event.toolResult.tool === "knowledgeBaseSearch" &&
+    event.toolResult.status !== "error"
+  );
 };
 
 export function ChatWorkspace() {
@@ -166,19 +229,20 @@ export function ChatWorkspace() {
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>(() => ({
     [bootSession.id]: [],
   }));
-  const [activityBySession, setActivityBySession] = useState<Record<string, ActivityItem[]>>(() => ({
-    [bootSession.id]: [],
-  }));
   const [streamingDraftBySession, setStreamingDraftBySession] = useState<
     Record<string, StreamingDraft | undefined>
   >(() => ({ [bootSession.id]: undefined }));
   const [draft, setDraft] = useState(INITIAL_PROMPT);
-  const [status, setStatus] = useState("准备就绪");
+  const [status, setStatus] = useState("企业知识助手已就绪");
   const [providerLabel, setProviderLabel] = useState("OpenAI Compatible");
   const [activeRun, setActiveRun] = useState<ActiveRunState | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [shouldAutoFollow, setShouldAutoFollow] = useState(true);
+
   const activeControllerRef = useRef<AbortController | null>(null);
+  const streamingDraftBySessionRef = useRef<Record<string, StreamingDraft | undefined>>({
+    [bootSession.id]: undefined,
+  });
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const autoScrollingRef = useRef(false);
@@ -186,7 +250,6 @@ export function ChatWorkspace() {
   const touchStartYRef = useRef<number | null>(null);
 
   const activeMessages = messagesBySession[activeSessionId] ?? [];
-  const activeActivities = activityBySession[activeSessionId] ?? [];
   const deferredMessages = useDeferredValue(activeMessages);
   const activeStreamingDraft = streamingDraftBySession[activeSessionId];
   const hasStreamingDraft = activeStreamingDraft !== undefined;
@@ -246,28 +309,53 @@ export function ChatWorkspace() {
     }));
   };
 
-  const appendActivity = (sessionId: string, activity: ActivityItem) => {
-    setActivityBySession((current) => ({
-      ...current,
-      [sessionId]: [...(current[sessionId] ?? []), activity].slice(-20),
-    }));
-  };
-
   const updateStreamingDraft = (
     sessionId: string,
-    updater: (current: StreamingDraft | undefined) => StreamingDraft,
+    updater: (current: StreamingDraft | undefined) => StreamingDraft | undefined,
   ) => {
-    setStreamingDraftBySession((current) => ({
-      ...current,
-      [sessionId]: updater(current[sessionId]),
-    }));
+    setStreamingDraftBySession((current) => {
+      const next = {
+        ...current,
+        [sessionId]: updater(current[sessionId]),
+      };
+      streamingDraftBySessionRef.current = next;
+      return next;
+    });
   };
 
   const clearStreamingDraft = (sessionId: string) => {
-    setStreamingDraftBySession((current) => ({
-      ...current,
-      [sessionId]: undefined,
-    }));
+    updateStreamingDraft(sessionId, () => undefined);
+  };
+
+  const setStreamingDraftStatus = (sessionId: string, nextStatus: StreamingDraft["status"]) => {
+    updateStreamingDraft(sessionId, (current) =>
+      current ? { ...current, status: nextStatus } : current,
+    );
+  };
+
+  const setStreamingDraftTrace = (sessionId: string, trace: AgentRunTrace) => {
+    updateStreamingDraft(sessionId, (current) => {
+      const draftState = createThoughtDraft(current);
+      return {
+        ...draftState,
+        trace,
+      };
+    });
+  };
+
+  const appendThought = (
+    sessionId: string,
+    activity: ActivityItem,
+    statusOverride?: StreamingDraft["status"],
+  ) => {
+    updateStreamingDraft(sessionId, (current) => {
+      const draftState = createThoughtDraft(current);
+      return {
+        ...draftState,
+        status: statusOverride ?? draftState.status,
+        thoughts: [...(draftState.thoughts ?? []).slice(-(MAX_THOUGHT_STEPS - 1)), activity],
+      };
+    });
   };
 
   useEffect(() => {
@@ -373,6 +461,7 @@ export function ChatWorkspace() {
     activeSessionId,
     activeStreamingDraft?.content,
     activeStreamingDraft?.status,
+    activeStreamingDraft?.thoughts?.length,
     deferredMessages.length,
     hasStreamingDraft,
     shouldAutoFollow,
@@ -400,24 +489,22 @@ export function ChatWorkspace() {
 
     const runSessionId = activeRun?.sessionId ?? activeSessionId;
     if (runSessionId) {
-      setStreamingDraftBySession((current) => {
-        const existing = current[runSessionId];
-        if (!existing) {
-          return current;
-        }
-
-        return {
-          ...current,
-          [runSessionId]: { ...existing, status: "stopped" },
-        };
-      });
+      setStreamingDraftStatus(runSessionId, "stopped");
     }
   };
 
   const handleEvent = (sessionId: string, event: AgentStreamEvent) => {
     if (event.type === "run_started") {
       setActiveRun({ sessionId, runId: event.runId });
-      appendActivity(sessionId, createActivity("run", "运行开始", `本轮运行 ID：${event.runId}`));
+      appendThought(
+        sessionId,
+        createActivity(
+          "run",
+          "开始思考",
+          "正在准备本轮上下文与执行路线。",
+          `运行 ID: ${event.runId}`,
+        ),
+      );
       setStatus("正在准备上下文...");
       return;
     }
@@ -430,12 +517,12 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "memory_compacted") {
-      appendActivity(
+      appendThought(
         sessionId,
         createActivity(
           "memory",
-          event.degraded ? "摘要复用" : "摘要更新",
-          event.message,
+          event.degraded ? "复用记忆摘要" : "更新记忆摘要",
+          localizeTraceText(event.message),
           event.summary,
         ),
       );
@@ -443,12 +530,16 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "tool_started") {
-      appendActivity(
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
+      appendThought(
         sessionId,
         createActivity(
           "tool-started",
-          `${event.toolCall.phase} → ${event.toolCall.tool}`,
-          "工具已启动",
+          formatToolStartedTitle(event.toolCall),
+          "已开始执行这一步。",
           safeJson(event.toolCall.input),
         ),
       );
@@ -456,84 +547,104 @@ export function ChatWorkspace() {
     }
 
     if (event.type === "tool_progress") {
-      appendActivity(
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
+      const progressMessage = formatToolProgressMessage(event.progress);
+      appendThought(
         sessionId,
         createActivity(
           "tool-progress",
-          event.progress.message,
-          event.progress.detail ?? event.progress.tool,
+          progressMessage,
+          localizeTraceText(event.progress.detail ?? "正在处理中。"),
         ),
       );
-      setStatus(event.progress.message);
+      setStatus(progressMessage);
       return;
     }
 
     if (event.type === "tool_result") {
-      appendActivity(
+      if (isKnowledgeBaseToolEvent(event)) {
+        return;
+      }
+
+      const resultSummary = formatToolResultSummary(event.toolResult);
+      appendThought(
         sessionId,
         createActivity(
           "tool-result",
-          describeToolResult(event.toolResult),
-          event.toolResult.summary,
-          toolResultDetail(event.toolResult),
+          formatToolResultTitle(event.toolResult),
+          resultSummary,
+          formatToolResultDetail(event.toolResult),
         ),
       );
-      setStatus(event.toolResult.summary);
+      setStatus(resultSummary);
+      return;
+    }
+
+    if (event.type === "rag_step") {
+      appendThought(sessionId, createRagStepActivity(event.step));
+      setStatus(event.step.label);
+      return;
+    }
+
+    if (event.type === "trace") {
+      setStreamingDraftTrace(sessionId, event.trace);
       return;
     }
 
     if (event.type === "assistant_started") {
+      appendThought(
+        sessionId,
+        createActivity("run", "组织回答", "正在整理检索结果并生成最终回复。"),
+      );
       setStatus("正在生成回答...");
       return;
     }
 
     if (event.type === "assistant_delta") {
-      updateStreamingDraft(sessionId, (current) => ({
-        id: current?.id ?? crypto.randomUUID(),
-        content: `${current?.content ?? ""}${event.delta}`,
-        status: "streaming",
-        createdAt: current?.createdAt ?? new Date().toISOString(),
-      }));
+      updateStreamingDraft(sessionId, (current) => {
+        const draftState = createThoughtDraft(current);
+        return {
+          ...draftState,
+          content: `${draftState.content}${event.delta}`,
+          status: "streaming",
+        };
+      });
       return;
     }
 
     if (event.type === "assistant_final") {
+      const currentDraft = streamingDraftBySessionRef.current[sessionId];
       const resolved = resolveAssistantFinalMessage({
-        draftContent: streamingDraftBySession[sessionId]?.content,
+        draftContent: currentDraft?.content,
         finalMessage: event.message,
       });
+
       clearStreamingDraft(sessionId);
-      appendMessage(sessionId, resolved.message);
-
-      if (resolved.usedDraft) {
-        appendActivity(
-          sessionId,
-          createActivity(
-            "run",
-            "Final 保护",
-            "检测到 final 文本短于已流出的草稿，已保留更长的流式内容。",
-            safeJson(resolved.message.metadata),
-          ),
-        );
-      }
-
+      appendMessage(
+        sessionId,
+        attachAssistantMetadataToMessage({
+          message: resolved.message,
+          thoughts: currentDraft?.thoughts ?? [],
+          trace:
+            currentDraft?.trace ??
+            ((resolved.message.metadata as Record<string, unknown> | undefined)?.trace as
+              | AgentRunTrace
+              | undefined),
+        }),
+      );
       setStatus("回答完成");
       return;
     }
 
     if (event.type === "assistant_aborted") {
-      setStreamingDraftBySession((current) => {
-        const existing = current[sessionId];
-        if (!existing) {
-          return current;
-        }
-
-        return {
-          ...current,
-          [sessionId]: { ...existing, status: "stopped" },
-        };
-      });
-      appendActivity(sessionId, createActivity("run", "运行中断", event.message));
+      appendThought(
+        sessionId,
+        createActivity("run", "已停止生成", localizeTraceText(event.message)),
+        "stopped",
+      );
       setStatus("已停止");
       setActiveRun(null);
       activeControllerRef.current = null;
@@ -542,12 +653,18 @@ export function ChatWorkspace() {
 
     if (event.type === "error") {
       const formatted = formatErrorMessage(event.message);
+      const currentDraft = streamingDraftBySessionRef.current[sessionId];
+
       setStatus(formatted);
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
-        createLocalMessage("assistant", formatted, {
-          kind: "system-error",
+        attachAssistantMetadataToMessage({
+          message: createLocalMessage("assistant", formatted, {
+            kind: "system-error",
+          }),
+          thoughts: currentDraft?.thoughts ?? [],
+          trace: currentDraft?.trace,
         }),
       );
       setActiveRun(null);
@@ -574,7 +691,6 @@ export function ChatWorkspace() {
     setProviderLabel("OpenAI Compatible");
     setStatus("正在提交请求...");
     setShouldAutoFollow(true);
-    appendActivity(sessionId, createActivity("run", "用户发起请求", content));
 
     const userMessage = createLocalMessage("user", content);
     appendMessage(sessionId, userMessage);
@@ -632,12 +748,18 @@ export function ChatWorkspace() {
       }
 
       const message = "请求没有顺利完成，请稍后重试。";
+      const currentDraft = streamingDraftBySessionRef.current[sessionId];
+
       setStatus(message);
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
-        createLocalMessage("assistant", message, {
-          kind: "system-error",
+        attachAssistantMetadataToMessage({
+          message: createLocalMessage("assistant", message, {
+            kind: "system-error",
+          }),
+          thoughts: currentDraft?.thoughts ?? [],
+          trace: currentDraft?.trace,
         }),
       );
       setActiveRun(null);
@@ -658,15 +780,15 @@ export function ChatWorkspace() {
         ...current,
         [session.id]: [],
       }));
-      setActivityBySession((current) => ({
-        ...current,
-        [session.id]: [],
-      }));
-      setStreamingDraftBySession((current) => ({
-        ...current,
-        [session.id]: undefined,
-      }));
-      setStatus("已新建一条对话。");
+      setStreamingDraftBySession((current) => {
+        const next = {
+          ...current,
+          [session.id]: undefined,
+        };
+        streamingDraftBySessionRef.current = next;
+        return next;
+      });
+      setStatus("已新建一条知识会话。");
       setDraft("");
       setProviderLabel("OpenAI Compatible");
       setShouldAutoFollow(true);
@@ -684,7 +806,7 @@ export function ChatWorkspace() {
     focusComposer();
   };
 
-  const handleComposerKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (event) => {
+  const handleComposerKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();
       if (isStreaming) {
@@ -750,8 +872,6 @@ export function ChatWorkspace() {
               textareaRef={textareaRef}
             />
           </section>
-
-          <ActivityPanel activities={activeActivities} formatTime={formatTime} status={status} />
         </div>
       </main>
     </div>

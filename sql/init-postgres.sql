@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS agent_run_logs (
   id BIGSERIAL PRIMARY KEY,
   run_id UUID NOT NULL UNIQUE,
   session_id TEXT NOT NULL,
+  task_category TEXT NOT NULL DEFAULT 'general',
   provider TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL CHECK (status IN ('completed', 'aborted', 'errored')),
   user_message TEXT NOT NULL,
@@ -16,3 +17,6 @@ CREATE TABLE IF NOT EXISTS agent_run_logs (
 
 CREATE INDEX IF NOT EXISTS agent_run_logs_session_id_finished_at_idx
   ON agent_run_logs (session_id, finished_at DESC);
+
+CREATE INDEX IF NOT EXISTS agent_run_logs_task_category_finished_at_idx
+  ON agent_run_logs (task_category, finished_at DESC);

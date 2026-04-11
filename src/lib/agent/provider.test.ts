@@ -206,6 +206,140 @@ describe("provider selection and API behavior", () => {
     });
   });
 
+  it("structures enterprise answers around internal knowledge and external references", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+
+      expect(body.messages[0]?.content).toContain("结论");
+      expect(body.messages[0]?.content).toContain("内部依据 and 外部参考");
+      expect(body.messages[1]?.content).toContain("internalKnowledgeBaseDocuments");
+      expect(body.messages[1]?.content).toContain("externalReferenceDocuments");
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"structured enterprise answer"}}]}\n\n',
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const answer = await provider.streamAnswer({
+      userMessage: "最近行业政策变化对我们有没有影响",
+      recentConversation: [],
+      memorySummary: "",
+      searchResults: [],
+      pageContents: [],
+      retrievalDocuments: [
+        {
+          id: "kb-1",
+          title: "员工费用报销制度（2026 版）",
+          source: "internal-doc",
+          url: "kb://enterprise/policies/expense-reimbursement-2026",
+          content: "internal content",
+          scores: { final: 0.92 },
+        },
+        {
+          id: "ext-1",
+          title: "政策新闻",
+          source: "reuters.com",
+          url: "https://www.reuters.com/example",
+          content: "external content",
+          scores: { final: 0.66 },
+        },
+      ],
+      toolResults: [],
+      onDelta: async () => {},
+    });
+
+    expect(answer.text).toBe("structured enterprise answer");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("injects direct-script guidance and grounding constraints for standard wording requests", async () => {
+    process.env.MODEL_PROVIDER = "openai";
+    process.env.OPENAI_COMPAT_API_KEY = "test-key";
+    process.env.OPENAI_MODEL = "test-model";
+    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
+
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+
+      expect(body.messages[0]?.content).toContain("标准话术");
+      expect(body.messages[0]?.content).not.toContain(
+        "Default answer structure: 结论, 适用范围/场景, 操作步骤或执行建议, 注意事项, 来源.",
+      );
+      expect(body.messages[0]?.content).toContain("Do not output placeholders such as [X]");
+      expect(body.messages[0]?.content).toContain("Use only facts that are explicitly supported");
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"标准话术\\n您好，我们已按退款规则为您核对处理。"}}]}\n\n',
+            ),
+          );
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { createProvider } = await import("./provider");
+    const provider = createProvider();
+    const answer = await provider.streamAnswer({
+      userMessage: "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合 SOP 给出标准说法。",
+      recentConversation: [],
+      memorySummary: "",
+      searchResults: [],
+      pageContents: [],
+      retrievalDocuments: [
+        {
+          id: "kb-refund",
+          title: "客服退款争议处理 SOP",
+          source: "internal-doc",
+          url: "kb://enterprise/sop/customer-service-refund-dispute",
+          content: "遇到退款争议时先确认订单状态、支付记录和退款规则，再向客户复述已核实的事实。",
+          scores: { final: 0.95 },
+        },
+      ],
+      toolResults: [],
+      onDelta: async () => {},
+    });
+
+    expect(answer.text).toContain("标准话术");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to a non-stream answer when streaming returns 403", async () => {
     process.env.MODEL_PROVIDER = "openai";
     process.env.OPENAI_COMPAT_API_KEY = "test-key";
@@ -575,42 +709,6 @@ describe("provider selection and API behavior", () => {
 
     expect(answer.finishReason).toBe("error");
     expect(answer.text).toContain("上游模型接口当前不可用");
-  });
-
-  it("does not truncate non-stream model output to the input char budget", async () => {
-    process.env.MODEL_PROVIDER = "openai";
-    process.env.OPENAI_COMPAT_API_KEY = "test-key";
-    process.env.OPENAI_MODEL = "test-model";
-    process.env.OPENAI_COMPAT_BASE_URL = "https://example.com/v1";
-    process.env.AGENT_COMPOSE_INPUT_CHAR_BUDGET = "8";
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            choices: [
-              {
-                message: {
-                  content:
-                    '{"decision":"answer","averageScore":0.82,"reason":"This is comfortably longer than eight."}',
-                },
-              },
-            ],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-      ),
-    );
-
-    const { createProvider } = await import("./provider");
-    const provider = createProvider();
-    const grade = await provider.gradeDocuments({
-      userMessage: "hello",
-      retrievalContext: [],
-    });
-
-    expect(grade.reason).toBe("This is comfortably longer than eight.");
   });
 
   it("keeps explicit mock mode without calling OpenAI", async () => {

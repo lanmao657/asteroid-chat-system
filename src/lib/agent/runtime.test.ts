@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runAgentTurn } from "./runtime";
 import { SearchToolError } from "./tools";
-import type { AgentStreamEvent, LLMProvider, RetrievalDocument } from "./types";
+import type { AgentStreamEvent, LLMProvider } from "./types";
 
 const collectEvents = () => {
   const events: AgentStreamEvent[] = [];
@@ -14,14 +14,6 @@ const collectEvents = () => {
   };
 };
 
-const createRetrievalDocument = (final = 0.72): RetrievalDocument => ({
-  id: "doc-1",
-  title: "Doc 1",
-  source: "knowledge-base",
-  content: "retrieval content",
-  scores: { final },
-});
-
 const createProvider = (): LLMProvider => ({
   id: "test-provider",
   label: "Test Provider",
@@ -32,14 +24,6 @@ const createProvider = (): LLMProvider => ({
     mode: strategyHint ?? "step-back",
     query: `${userMessage} rewritten`,
     reason: "rewrite requested",
-  })),
-  gradeDocuments: vi.fn(async ({ retrievalContext }) => ({
-    decision:
-      retrievalContext.length > 0 && retrievalContext[0].scores.final > 0.55
-        ? ("answer" as const)
-        : ("rewrite" as const),
-    averageScore: retrievalContext.length > 0 ? retrievalContext[0].scores.final : 0,
-    reason: "graded",
   })),
   decideWebSearchToolCall: vi.fn(async ({ userMessage }) => ({
     status: /latest|recent|today|current|news/i.test(userMessage)
@@ -113,7 +97,19 @@ describe("runAgentTurn", () => {
         provider: "knowledge-base" as const,
         strategy: "hybrid" as const,
         reranked: false,
-        documents: [createRetrievalDocument()],
+        documents: [
+          {
+            id: "doc-kb",
+            title: "Agent workspace design playbook",
+            source: "internal-doc",
+            url: "kb://enterprise/docs/agent-workspace-design",
+            content: "agent workspace design docs and implementation guidance",
+            metadata: {
+              tags: ["agent", "workspace", "design", "docs"],
+            },
+            scores: { final: 0.72 },
+          },
+        ],
       };
     });
     const { events, emit } = collectEvents();
@@ -131,11 +127,254 @@ describe("runAgentTurn", () => {
     });
 
     expect(result.status).toBe("completed");
+    expect(result.taskCategory).toBe("general");
     expect(searchKnowledgeBase).toHaveBeenCalledTimes(1);
-    expect(provider.gradeDocuments).toHaveBeenCalledTimes(1);
     expect(events.map((event) => event.type)).toContain("tool_started");
     expect(events.map((event) => event.type)).toContain("tool_progress");
     expect(events.map((event) => event.type)).toContain("tool_result");
+    expect(events.map((event) => event.type)).toContain("rag_step");
+    const toolResultEvent = events.find(
+      (event) =>
+        event.type === "tool_result" &&
+        event.toolResult.tool === "knowledgeBaseSearch",
+    );
+    expect(toolResultEvent?.type).toBe("tool_result");
+    if (toolResultEvent?.type === "tool_result") {
+      const detail = JSON.parse(toolResultEvent.toolResult.detail ?? "{}") as Record<string, unknown>;
+      expect(detail.decisionSource).toBe("retrieval-heuristic");
+      expect(detail.coverageRatio).toBeGreaterThan(0);
+    }
+    const ragStepLabels = events
+      .filter((event): event is Extract<AgentStreamEvent, { type: "rag_step" }> => event.type === "rag_step")
+      .map((event) => event.step.label);
+    expect(ragStepLabels).toContain("Searching");
+    expect(ragStepLabels).toContain("Grading");
+  });
+
+  it("triggers a rewrite when knowledge-base retrieval is weak", async () => {
+    const provider = createProvider();
+    const searchKnowledgeBase = vi
+      .fn()
+      .mockResolvedValueOnce({
+        provider: "knowledge-base" as const,
+        strategy: "hybrid" as const,
+        reranked: false,
+        documents: [
+          {
+            id: "weak-1",
+            title: "General workspace note",
+            source: "internal-doc",
+            content: "generic internal note with fuzzy similarity only",
+            scores: { final: 0.61 },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        provider: "knowledge-base" as const,
+        strategy: "hybrid" as const,
+        reranked: false,
+        documents: [
+          {
+            id: "strong-1",
+            title: "Customer service refund dispute SOP",
+            source: "internal-doc",
+            url: "kb://enterprise/sop/customer-service-refund-dispute",
+            content: "refund dispute sop for customer service complaints",
+            metadata: {
+              tags: ["customer", "service", "refund", "dispute", "sop"],
+            },
+            scores: { final: 0.88 },
+          },
+        ],
+      });
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-rewrite",
+      userMessage: "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        searchKnowledgeBase,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(searchKnowledgeBase).toHaveBeenCalledTimes(2);
+    expect(provider.rewriteQuery).toHaveBeenCalledTimes(1);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_progress" &&
+          event.progress.message === "Rewriting -> step-back",
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "rag_step" && event.step.stage === "rewriting",
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a strong refund sop retrieval on answer without rewriting", async () => {
+    const provider = createProvider();
+    const searchKnowledgeBase = vi.fn(async () => ({
+      provider: "knowledge-base" as const,
+      strategy: "hybrid" as const,
+      reranked: false,
+      documents: [
+        {
+          id: "refund-sop",
+          title: "客服退款争议处理 SOP",
+          source: "internal-doc",
+          url: "kb://enterprise/sop/customer-service-refund-dispute",
+          content:
+            "遇到退款争议时先确认订单状态、支付记录和退款规则，再向客户复述已核实的事实。可退场景应在 2 小时内发起退款申请，并同步预计到账时间。",
+          metadata: {
+            tags: ["客服", "退款", "SOP", "话术", "投诉"],
+          },
+          scores: { final: 0.92 },
+        },
+        {
+          id: "unrelated-1",
+          title: "员工费用报销制度",
+          source: "internal-doc",
+          content: "reimbursement policy",
+          scores: { final: 0.22 },
+        },
+        {
+          id: "unrelated-2",
+          title: "新员工培训手册",
+          source: "internal-doc",
+          content: "onboarding guide",
+          scores: { final: 0.18 },
+        },
+      ],
+    }));
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-refund",
+      userMessage: "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        searchKnowledgeBase,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(provider.rewriteQuery).not.toHaveBeenCalled();
+    const toolResultEvent = events.find(
+      (event) =>
+        event.type === "tool_result" &&
+        event.toolResult.tool === "knowledgeBaseSearch",
+    );
+    expect(toolResultEvent?.type).toBe("tool_result");
+    if (toolResultEvent?.type === "tool_result") {
+      const detail = JSON.parse(toolResultEvent.toolResult.detail ?? "{}") as Record<string, unknown>;
+      expect(detail.queryUsed).toBe(
+        "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+      );
+      expect(detail.coverageRatio).toBeGreaterThan(0.3);
+      expect(detail.topDocument).toBeTruthy();
+    }
+  });
+
+  it("keeps internal knowledge results and supplements them with web research for policy-change questions", async () => {
+    const provider = createProvider();
+    vi.mocked(provider.decideWebSearchToolCall).mockResolvedValue({
+      status: "call",
+      query: "industry policy changes impact",
+      reason: "decided",
+    });
+    const searchKnowledgeBase = vi.fn(async () => ({
+      provider: "knowledge-base" as const,
+      strategy: "hybrid" as const,
+      reranked: false,
+      documents: [
+        {
+          id: "policy-watch",
+          title: "外部政策与行业动态跟踪建议",
+          source: "internal-doc",
+          url: "kb://enterprise/research/policy-watch",
+          content:
+            "当问题涉及最近行业政策变化时，可根据公司制度先明确外部事实，再补充内部制度或流程。",
+          metadata: {
+            tags: ["公司制度", "最近行业政策变化", "外部参考"],
+          },
+          scores: { final: 0.86 },
+        },
+      ],
+    }));
+    const search = vi.fn(async () => ({
+      provider: "tavily" as const,
+      queryUsed: "最近行业政策变化对我们有没有影响",
+      rawCount: 1,
+      normalizedCount: 1,
+      filterReasons: {},
+      attempts: [],
+      results: [
+        {
+          title: "行业政策更新",
+          url: "https://www.reuters.com/world/china/policy-update",
+          snippet: "recent policy update",
+          domain: "reuters.com",
+          evidence: "search-snippet" as const,
+          fetchStatus: "pending" as const,
+          rankingSignals: ["trusted-domain", "news-keyword"],
+          score: 12,
+        },
+      ],
+      filteredResults: [],
+    }));
+    const fetchPage = vi.fn(async () => ({
+      title: "行业政策更新",
+      url: "https://www.reuters.com/world/china/policy-update",
+      description: "desc",
+      excerpt: "full excerpt",
+    }));
+    const { events, emit } = collectEvents();
+
+    const result = await runAgentTurn({
+      sessionId: "session-policy",
+      userMessage: "根据公司制度，最近行业政策变化对我们有没有影响？",
+      conversation: [],
+      memorySummary: "",
+      emit,
+      dependencies: {
+        provider,
+        searchKnowledgeBase,
+        search,
+        fetchPage,
+      },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.taskCategory).toBe("policy_qa");
+    expect(searchKnowledgeBase).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_result" &&
+          event.toolResult.tool === "knowledgeBaseSearch",
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "tool_result" &&
+          event.toolResult.tool === "searchWeb" &&
+          event.toolResult.summary.includes("External web research"),
+      ),
+    ).toBe(true);
   });
 
   it("returns aborted state when the signal aborts during generation", async () => {
@@ -148,11 +387,6 @@ describe("runAgentTurn", () => {
         mode: "step-back" as const,
         query: "rewritten",
         reason: "reason",
-      })),
-      gradeDocuments: vi.fn(async () => ({
-        decision: "answer" as const,
-        averageScore: 0.8,
-        reason: "good enough",
       })),
       decideWebSearchToolCall: vi.fn(async () => ({
         status: "none" as const,
@@ -195,11 +429,6 @@ describe("runAgentTurn", () => {
         query: "rewritten",
         reason: "reason",
       })),
-      gradeDocuments: vi.fn(async () => ({
-        decision: "answer" as const,
-        averageScore: 0.9,
-        reason: "good enough",
-      })),
       decideWebSearchToolCall: vi.fn(async () => ({
         status: "none" as const,
         reason: "not needed",
@@ -235,11 +464,6 @@ describe("runAgentTurn", () => {
         mode: "step-back" as const,
         query: "rewritten",
         reason: "reason",
-      })),
-      gradeDocuments: vi.fn(async () => ({
-        decision: "answer" as const,
-        averageScore: 0.9,
-        reason: "good enough",
       })),
       decideWebSearchToolCall: vi.fn(async () => ({
         status: "none" as const,
@@ -300,11 +524,6 @@ describe("runAgentTurn", () => {
         mode: "step-back" as const,
         query: "rewritten",
         reason: "reason",
-      })),
-      gradeDocuments: vi.fn(async () => ({
-        decision: "answer" as const,
-        averageScore: 0.9,
-        reason: "good enough",
       })),
       decideWebSearchToolCall: vi.fn(async () => ({
         status: "none" as const,
@@ -471,11 +690,6 @@ describe("runAgentTurn", () => {
         mode: "step-back" as const,
         query: "rewritten",
         reason: "reason",
-      })),
-      gradeDocuments: vi.fn(async () => ({
-        decision: "answer" as const,
-        averageScore: 0.9,
-        reason: "good enough",
       })),
       decideWebSearchToolCall: vi.fn(async () => ({
         status: "call" as const,

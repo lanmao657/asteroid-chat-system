@@ -1,10 +1,10 @@
-# Agent Chat Workspace
+# Enterprise Knowledge Assistant
 
-一个基于 Next.js 16、React 19 和 TypeScript 的聊天原型，当前支持：
+一个基于 Next.js 16、React 19 和 TypeScript 的企业培训 / 内部知识助手原型，当前支持：
 
 - 单 SSE 通道流式回答
 - 会话摘要记忆压缩
-- 联网检索、知识库检索与天气查询
+- 内部知识库检索、联网补充检索与天气查询
 - 查询重写、相关性评分门控与可选 rerank
 - 实时 RAG 过程可视化
 - 前端主动停止生成
@@ -126,6 +126,7 @@ This project also lazily creates the table on first successful database write, s
 
 - `run_id`: unique run identifier
 - `session_id`: current chat session id
+- `task_category`: inferred task category such as `policy_qa`, `training_summary`, `sop_lookup`, `case_review`, or `general`
 - `provider`: model/provider label emitted by the runtime
 - `status`: `completed`, `aborted`, or `errored`
 - `user_message`: incoming user prompt

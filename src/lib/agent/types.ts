@@ -65,10 +65,20 @@ export interface FetchedPage {
 export interface KnowledgeBaseDocument {
   id: string;
   title: string;
+  category:
+    | "制度政策"
+    | "岗位流程"
+    | "培训课件"
+    | "业务 FAQ"
+    | "案例复盘"
+    | "外部参考";
   source: string;
   url?: string;
   content: string;
   tags: string[];
+  department: string;
+  applicableRoles: string[];
+  updatedAt: string;
 }
 
 export interface RetrievalDocument {
@@ -102,9 +112,20 @@ export interface QueryRewriteResult {
   reason: string;
 }
 
-export interface GradeDocumentsResult {
+export interface KnowledgeBaseRetrievalAssessment {
   decision: "answer" | "rewrite";
-  averageScore: number;
+  decisionSource: "retrieval-heuristic";
+  queryTerms: string[];
+  topDocument: {
+    id: string;
+    title: string;
+    titleTagHits: string[];
+    contentHits: string[];
+    overlapCount: number;
+  } | null;
+  coverageRatio: number;
+  relevantDocumentCount: number;
+  topGap: number;
   reason: string;
 }
 
@@ -146,6 +167,24 @@ export interface RetrievalStep {
   metadata?: Record<string, unknown>;
 }
 
+export type RetrievalRoute = "web" | "knowledge-base" | "weather" | "none";
+
+export interface AgentRunTrace {
+  route: RetrievalRoute;
+  originalQuery: string;
+  finalQuery: string;
+  searchStrategy?: "hybrid" | "dense-only";
+  grading?: KnowledgeBaseRetrievalAssessment;
+  rewrite?: QueryRewriteResult;
+  retrievedDocuments: Array<{
+    id: string;
+    title: string;
+    source: string;
+    score: number;
+  }>;
+  steps: RetrievalStep[];
+}
+
 export interface ToolResult {
   callId: string;
   tool: ToolName;
@@ -170,9 +209,18 @@ export interface AgentState {
   recentConversation: ChatMessage[];
   memorySummary: string;
   toolResults: ToolResult[];
+  taskCategory: AgentRunTaskCategory;
   status: "running" | "completed" | "aborted" | "errored";
   assistantText: string;
+  trace?: AgentRunTrace;
 }
+
+export type AgentRunTaskCategory =
+  | "policy_qa"
+  | "training_summary"
+  | "sop_lookup"
+  | "case_review"
+  | "general";
 
 export interface SummarizeConversationInput {
   existingSummary: string;
@@ -219,19 +267,12 @@ export interface RewriteQueryInput {
   signal?: AbortSignal;
 }
 
-export interface GradeDocumentsInput {
-  userMessage: string;
-  retrievalContext: RetrievalDocument[];
-  signal?: AbortSignal;
-}
-
 export interface LLMProvider {
   readonly id: string;
   readonly label: string;
   summarizeConversation(input: SummarizeConversationInput): Promise<string>;
   streamAnswer(input: StreamAnswerInput): Promise<StreamAnswerResult>;
   rewriteQuery(input: RewriteQueryInput): Promise<QueryRewriteResult>;
-  gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult>;
   decideWebSearchToolCall(input: DecideWebSearchInput): Promise<WebSearchToolDecision>;
 }
 
@@ -263,6 +304,14 @@ export type AgentStreamEvent =
   | {
       type: "tool_result";
       toolResult: ToolResult;
+    }
+  | {
+      type: "rag_step";
+      step: RetrievalStep;
+    }
+  | {
+      type: "trace";
+      trace: AgentRunTrace;
     }
   | {
       type: "assistant_started";

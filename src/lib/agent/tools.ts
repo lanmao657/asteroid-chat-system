@@ -5,6 +5,7 @@ import { knowledgeBaseDocuments } from "@/lib/agent/knowledge-base";
 import { webSearch, WebSearchError } from "@/tools/webSearch";
 import type {
   FetchedPage,
+  KnowledgeBaseRetrievalAssessment,
   RetrievalDocument,
   SearchProviderName,
   SearchResult,
@@ -157,6 +158,31 @@ const GENERIC_NEWS_ROUNDUP_TERMS = new Set([
 const AI_TOPIC_PATTERN =
   /\bai\b|artificial intelligence|\u4eba\u5de5\u667a\u80fd|\u667a\u80fd\u4f53|agent|agents|llm|\u5927\u6a21\u578b/i;
 const BROAD_AI_ENTITY_QUERY = "OpenAI Anthropic Google Meta AI news last week";
+const KB_QUERY_NOISE_TERMS = new Set([
+  "请",
+  "请问",
+  "结合",
+  "给出",
+  "标准",
+  "说法",
+  "回复",
+  "应该",
+  "怎么",
+  "如何",
+  "一下",
+  "一个",
+  "场景",
+  "时候",
+  "时",
+  "吗",
+  "呢",
+  "请按",
+  "按照",
+  "输出",
+  "说明",
+  "建议",
+  "内容",
+]);
 
 interface FilterAndRankResponse {
   results: SearchResult[];
@@ -330,6 +356,63 @@ const buildCounter = (tokens: string[]) => {
     counter.set(token, (counter.get(token) ?? 0) + 1);
   }
   return counter;
+};
+
+const unique = <T>(values: T[]) => Array.from(new Set(values));
+
+const normalizeForMatch = (value: string) =>
+  normalizeWhitespace(value).toLowerCase();
+
+const collectChineseCorpusTerms = (value: string) => {
+  const compact = normalizeForMatch(value).replace(/[^a-z0-9\u4e00-\u9fa5]/g, "");
+  const terms: string[] = [];
+
+  for (let size = 2; size <= 6; size += 1) {
+    for (let index = 0; index <= compact.length - size; index += 1) {
+      const candidate = compact.slice(index, index + size);
+      if (/^[a-z0-9]+$/.test(candidate)) {
+        continue;
+      }
+      if (KB_QUERY_NOISE_TERMS.has(candidate)) {
+        continue;
+      }
+      terms.push(candidate);
+    }
+  }
+
+  return unique(terms);
+};
+
+const extractKnowledgeQueryTerms = (query: string, corpusTexts: string[]) => {
+  const normalized = normalizeForMatch(query);
+  const englishTerms = normalized
+    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
+    .filter(Boolean)
+    .filter((term) => /[a-z0-9]/.test(term))
+    .filter((term) => term.length > 1)
+    .filter((term) => !KB_QUERY_NOISE_TERMS.has(term));
+  const chineseCandidates = collectChineseCorpusTerms(normalized);
+  const corpus = corpusTexts
+    .map((text) => normalizeForMatch(text))
+    .join(" ");
+
+  const candidates = unique([...englishTerms, ...chineseCandidates])
+    .filter((term) => term.length > 1)
+    .filter((term) => corpus.includes(term))
+    .sort((left, right) => right.length - left.length);
+
+  const selected: string[] = [];
+  for (const term of candidates) {
+    if (selected.some((existing) => existing.includes(term))) {
+      continue;
+    }
+    selected.push(term);
+    if (selected.length >= 8) {
+      break;
+    }
+  }
+
+  return selected;
 };
 
 const reciprocalRankFusion = (...ranks: number[]) =>
@@ -1135,7 +1218,13 @@ export const searchKnowledgeBase = async ({
           source: document.source,
           url: document.url,
           content: document.content,
-          metadata: { tags: document.tags },
+          metadata: {
+            tags: document.tags,
+            category: document.category,
+            department: document.department,
+            applicableRoles: document.applicableRoles,
+            updatedAt: document.updatedAt,
+          },
           scores: {
             sparse: sparseScore,
             dense: denseScore,
@@ -1168,7 +1257,13 @@ export const searchKnowledgeBase = async ({
           source: document.source,
           url: document.url,
           content: document.content,
-          metadata: { tags: document.tags },
+          metadata: {
+            tags: document.tags,
+            category: document.category,
+            department: document.department,
+            applicableRoles: document.applicableRoles,
+            updatedAt: document.updatedAt,
+          },
           scores: {
             dense: denseScore,
             final: denseScore,
@@ -1247,6 +1342,96 @@ export const searchKnowledgeBase = async ({
     documents,
     strategy,
     reranked,
+  };
+};
+
+export const assessKnowledgeBaseRetrieval = ({
+  query,
+  documents,
+}: {
+  query: string;
+  documents: RetrievalDocument[];
+}): KnowledgeBaseRetrievalAssessment => {
+  const queryTerms = extractKnowledgeQueryTerms(query, [
+    ...knowledgeBaseDocuments.map(
+      (document) => `${document.title} ${document.tags.join(" ")} ${document.content}`,
+    ),
+    ...documents.map(
+      (document) =>
+        `${document.title} ${String((document.metadata?.tags as string[] | undefined)?.join(" ") ?? "")} ${document.content}`,
+    ),
+  ]);
+
+  const documentMetrics = documents.map((document) => {
+    const titleTagHaystack = normalizeForMatch(
+      `${document.title} ${String((document.metadata?.tags as string[] | undefined)?.join(" ") ?? "")}`,
+    );
+    const contentHaystack = normalizeForMatch(document.content);
+    const titleTagHits = queryTerms.filter((term) => titleTagHaystack.includes(term));
+    const contentHits = queryTerms.filter(
+      (term) => !titleTagHits.includes(term) && contentHaystack.includes(term),
+    );
+    const overlapCount = unique([...titleTagHits, ...contentHits]).length;
+
+    return {
+      document,
+      titleTagHits,
+      contentHits,
+      overlapCount,
+    };
+  });
+
+  const topMetric = documentMetrics[0] ?? null;
+  const secondMetric = documentMetrics[1] ?? null;
+  const coverageRatio =
+    topMetric && queryTerms.length > 0 ? topMetric.overlapCount / queryTerms.length : 0;
+  const relevantDocumentCount = documentMetrics.filter(
+    (metric) => metric.titleTagHits.length > 0 || metric.overlapCount >= 2,
+  ).length;
+  const topGap = topMetric
+    ? topMetric.overlapCount - (secondMetric?.overlapCount ?? 0)
+    : 0;
+
+  let decision: KnowledgeBaseRetrievalAssessment["decision"] = "rewrite";
+  if (
+    topMetric &&
+    queryTerms.length > 0 &&
+    topMetric.titleTagHits.length > 0 &&
+    coverageRatio >= 0.4 &&
+    relevantDocumentCount >= 1 &&
+    topGap >= 1
+  ) {
+    decision = "answer";
+  }
+
+  const reasonParts = [
+    queryTerms.length > 0
+      ? `matched ${topMetric?.overlapCount ?? 0}/${queryTerms.length} query terms in the top document`
+      : "no stable query terms were extracted from the request",
+    topMetric?.titleTagHits.length
+      ? `title/tag alignment on ${topMetric.titleTagHits.length} term(s)`
+      : "no title/tag alignment in the top document",
+    `relevant documents: ${relevantDocumentCount}`,
+    `top gap: ${topGap}`,
+  ];
+
+  return {
+    decision,
+    decisionSource: "retrieval-heuristic",
+    queryTerms,
+    topDocument: topMetric
+      ? {
+          id: topMetric.document.id,
+          title: topMetric.document.title,
+          titleTagHits: topMetric.titleTagHits,
+          contentHits: topMetric.contentHits,
+          overlapCount: topMetric.overlapCount,
+        }
+      : null,
+    coverageRatio: Number(coverageRatio.toFixed(3)),
+    relevantDocumentCount,
+    topGap,
+    reason: reasonParts.join("; "),
   };
 };
 

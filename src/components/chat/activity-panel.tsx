@@ -19,7 +19,7 @@ export function ActivityPanel({ activities, formatTime, status }: ActivityPanelP
     <aside className={styles.activityPanel}>
       <div className={styles.activityPanelHeader}>
         <div>
-          <div className={styles.activityEyebrow}>Tools and retrieval</div>
+          <div className={styles.activityEyebrow}>工具与检索</div>
           <div className={styles.activityTitle}>运行轨迹</div>
         </div>
         <button
