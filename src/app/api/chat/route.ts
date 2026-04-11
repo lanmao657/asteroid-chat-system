@@ -12,7 +12,12 @@ import {
   insertAgentRunLog,
   type PersistedAgentRunStatus,
 } from "@/lib/db/agent-run-log-repository";
-import type { AgentStreamEvent, ChatMessage, ToolResult } from "@/lib/agent/types";
+import type {
+  AgentRunTaskCategory,
+  AgentStreamEvent,
+  ChatMessage,
+  ToolResult,
+} from "@/lib/agent/types";
 
 const requestSchema = z.object({
   sessionId: z.string().min(1),
@@ -48,6 +53,7 @@ export const runtime = "nodejs";
 const persistRunLogSafely = async ({
   runId,
   sessionId,
+  taskCategory,
   provider,
   status,
   userMessage,
@@ -60,6 +66,7 @@ const persistRunLogSafely = async ({
 }: {
   runId: string;
   sessionId: string;
+  taskCategory: AgentRunTaskCategory;
   provider: string;
   status: PersistedAgentRunStatus;
   userMessage: string;
@@ -75,6 +82,7 @@ const persistRunLogSafely = async ({
       runId,
       sessionId,
       provider,
+      taskCategory,
       status,
       userMessage,
       assistantMessage,
@@ -149,6 +157,7 @@ export async function POST(request: Request) {
           runId: result.runId,
           sessionId: payload.sessionId,
           provider: providerLabel || "unknown",
+          taskCategory: result.taskCategory,
           status: result.status === "aborted" ? "aborted" : "completed",
           userMessage: payload.message,
           assistantMessage: result.assistantText,
@@ -171,6 +180,7 @@ export async function POST(request: Request) {
           runId: currentRunId || crypto.randomUUID(),
           sessionId: payload.sessionId,
           provider: providerLabel || "unknown",
+          taskCategory: "general",
           status: "errored",
           userMessage: payload.message,
           assistantMessage: "",

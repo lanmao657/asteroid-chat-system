@@ -34,7 +34,7 @@ export function ChatHeader({
         ) : null}
 
         <div className={styles.topbarMeta}>
-          <div className={styles.topbarEyebrow}>Asteroid</div>
+          <div className={styles.topbarEyebrow}>北辰知识助手</div>
           <div className={styles.topbarTitleRow}>
             <h1 className={styles.topbarTitle}>{title}</h1>
             <span className={styles.providerPill}>{providerLabel}</span>

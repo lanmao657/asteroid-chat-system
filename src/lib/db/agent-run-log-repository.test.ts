@@ -30,6 +30,7 @@ describe("agent-run-log-repository", () => {
     await insertAgentRunLog({
       runId: "11111111-1111-4111-8111-111111111111",
       sessionId: "session-1",
+      taskCategory: "policy_qa",
       provider: "OpenAI Compatible",
       status: "completed",
       userMessage: "hello",
@@ -43,7 +44,8 @@ describe("agent-run-log-repository", () => {
     expect(ensureDatabaseSchema).toHaveBeenCalledTimes(1);
     expect(query).toHaveBeenCalledTimes(1);
     expect(query.mock.calls[0]?.[1]?.[0]).toBe("11111111-1111-4111-8111-111111111111");
-    expect(query.mock.calls[0]?.[1]?.[7]).toBe("[]");
+    expect(query.mock.calls[0]?.[1]?.[2]).toBe("policy_qa");
+    expect(query.mock.calls[0]?.[1]?.[8]).toBe("[]");
   });
 
   it("lists latest run logs in finished time order", async () => {
@@ -53,6 +55,7 @@ describe("agent-run-log-repository", () => {
           id: 1,
           run_id: "11111111-1111-4111-8111-111111111111",
           session_id: "session-1",
+          task_category: "sop_lookup",
           provider: "OpenAI Compatible",
           status: "completed",
           user_message: "hello",
@@ -79,6 +82,7 @@ describe("agent-run-log-repository", () => {
         id: 1,
         runId: "11111111-1111-4111-8111-111111111111",
         sessionId: "session-1",
+        taskCategory: "sop_lookup",
         provider: "OpenAI Compatible",
         status: "completed",
         userMessage: "hello",

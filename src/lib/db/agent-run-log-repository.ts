@@ -1,4 +1,4 @@
-import type { ToolResult } from "@/lib/agent/types";
+import type { AgentRunTaskCategory, ToolResult } from "@/lib/agent/types";
 import { getDbPool } from "@/lib/db/client";
 import { AGENT_RUN_LOGS_TABLE, ensureDatabaseSchema } from "@/lib/db/schema";
 
@@ -7,6 +7,7 @@ export type PersistedAgentRunStatus = "completed" | "aborted" | "errored";
 export interface PersistAgentRunLogInput {
   runId: string;
   sessionId: string;
+  taskCategory: AgentRunTaskCategory;
   provider: string;
   status: PersistedAgentRunStatus;
   userMessage: string;
@@ -22,6 +23,7 @@ export interface AgentRunLogRecord {
   id: number;
   runId: string;
   sessionId: string;
+  taskCategory: AgentRunTaskCategory;
   provider: string;
   status: PersistedAgentRunStatus;
   userMessage: string;
@@ -38,6 +40,7 @@ interface AgentRunLogRow {
   id: number;
   run_id: string;
   session_id: string;
+  task_category: AgentRunTaskCategory;
   provider: string;
   status: PersistedAgentRunStatus;
   user_message: string;
@@ -54,6 +57,7 @@ const mapRow = (row: AgentRunLogRow): AgentRunLogRecord => ({
   id: row.id,
   runId: row.run_id,
   sessionId: row.session_id,
+  taskCategory: row.task_category,
   provider: row.provider,
   status: row.status,
   userMessage: row.user_message,
@@ -79,6 +83,7 @@ export const insertAgentRunLog = async (input: PersistAgentRunLogInput) => {
       INSERT INTO ${AGENT_RUN_LOGS_TABLE} (
         run_id,
         session_id,
+        task_category,
         provider,
         status,
         user_message,
@@ -89,10 +94,11 @@ export const insertAgentRunLog = async (input: PersistAgentRunLogInput) => {
         started_at,
         finished_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
       ON CONFLICT (run_id)
       DO UPDATE SET
         session_id = EXCLUDED.session_id,
+        task_category = EXCLUDED.task_category,
         provider = EXCLUDED.provider,
         status = EXCLUDED.status,
         user_message = EXCLUDED.user_message,
@@ -106,6 +112,7 @@ export const insertAgentRunLog = async (input: PersistAgentRunLogInput) => {
     [
       input.runId,
       input.sessionId,
+      input.taskCategory,
       input.provider,
       input.status,
       input.userMessage,

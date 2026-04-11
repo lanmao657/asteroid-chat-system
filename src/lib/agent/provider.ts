@@ -1,10 +1,12 @@
 import { agentEnv } from "@/lib/agent/env";
-import { getPresentationStyleInstruction } from "@/lib/agent/presentation";
+import {
+  getDirectScriptStyleInstruction,
+  isDirectScriptIntent,
+  getPresentationStyleInstruction,
+} from "@/lib/agent/presentation";
 import type {
   ChatMessage,
   DecideWebSearchInput,
-  GradeDocumentsInput,
-  GradeDocumentsResult,
   LLMProvider,
   ModelFinishReason,
   QueryRewriteResult,
@@ -61,11 +63,6 @@ const formatToolResults = (toolResults: ToolResult[]) =>
     detail: result.detail ? clip(result.detail, 600) : undefined,
   }));
 
-const average = (numbers: number[]) =>
-  numbers.length === 0
-    ? 0
-    : numbers.reduce((total, value) => total + value, 0) / numbers.length;
-
 const extractJsonObject = (value: string) => {
   const fenced = value.match(/```json\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
@@ -112,22 +109,6 @@ class MockLLMProvider implements LLMProvider {
     };
   }
 
-  async gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult> {
-    const scores = input.retrievalContext.map((document) => document.scores.final);
-    const averageScore = average(scores);
-    return averageScore >= 0.55
-      ? {
-          decision: "answer",
-          averageScore,
-          reason: "候选文档相关性足够，可以直接回答。",
-        }
-      : {
-          decision: "rewrite",
-          averageScore,
-          reason: "候选文档相关性偏弱，建议触发查询重写。",
-        };
-  }
-
   async decideWebSearchToolCall(
     input: DecideWebSearchInput,
   ): Promise<WebSearchToolDecision> {
@@ -153,12 +134,12 @@ class MockLLMProvider implements LLMProvider {
 
   async streamAnswer(input: StreamAnswerInput) {
     const text = [
-      "这是 mock provider 的流式回答。",
+      "这是企业知识助手的 mock provider 流式回答。",
       input.memorySummary ? `记忆摘要：${clip(input.memorySummary, 120)}` : "",
       input.retrievalDocuments.length > 0
-        ? `检索到 ${input.retrievalDocuments.length} 条候选来源，并完成可观测处理。`
+        ? `检索到 ${input.retrievalDocuments.length} 条候选来源，并完成企业知识问答所需的可观测处理。`
         : input.searchResults.length > 0
-          ? `网页搜索命中 ${input.searchResults.length} 条结果，抓取了 ${input.pageContents.length} 个正文来源。`
+          ? `外部网页搜索命中 ${input.searchResults.length} 条结果，抓取了 ${input.pageContents.length} 个正文来源。`
           : "这轮没有触发外部检索。",
       `当前问题：${clip(normalizeWhitespace(input.userMessage), 160)}`,
     ]
@@ -272,64 +253,6 @@ class OpenAICompatibleProvider implements LLMProvider {
           mode: "step-back",
           query: `${input.userMessage} overview background fundamentals`,
           reason: "Fallback Step-Back rewrite applied.",
-        };
-  }
-
-  async gradeDocuments(input: GradeDocumentsInput): Promise<GradeDocumentsResult> {
-    const text = await this.generateText(
-      [
-        {
-          role: "system",
-          content: [
-            "You grade retrieval relevance for a RAG system.",
-            "Return JSON with keys: decision, averageScore, reason.",
-            "decision must be answer or rewrite.",
-            "averageScore must be a number between 0 and 1.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
-            {
-              userMessage: input.userMessage,
-              retrievalContext: input.retrievalContext.slice(0, 5).map((document) => ({
-                title: document.title,
-                source: document.source,
-                content: clip(document.content, 260),
-                score: document.scores.final,
-              })),
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-      input.signal,
-      160,
-    );
-
-    try {
-      const parsed = JSON.parse(extractJsonObject(text)) as GradeDocumentsResult;
-      if (
-        (parsed.decision === "answer" || parsed.decision === "rewrite") &&
-        Number.isFinite(parsed.averageScore) &&
-        parsed.reason
-      ) {
-        return parsed;
-      }
-    } catch {}
-
-    const fallbackAverage = average(input.retrievalContext.map((document) => document.scores.final));
-    return fallbackAverage >= 0.55
-      ? {
-          decision: "answer",
-          averageScore: fallbackAverage,
-          reason: "Fallback relevance grade passed.",
-        }
-      : {
-          decision: "rewrite",
-          averageScore: fallbackAverage,
-          reason: "Fallback relevance grade requested rewrite.",
         };
   }
 
@@ -580,42 +503,76 @@ class OpenAICompatibleProvider implements LLMProvider {
     const presentationStyleInstruction = getPresentationStyleInstruction(
       input.userMessage,
     );
+    const directScriptStyleInstruction = getDirectScriptStyleInstruction(
+      input.userMessage,
+    );
+    const isDirectScriptRequest = isDirectScriptIntent(input.userMessage);
+    const internalDocuments = input.retrievalDocuments
+      .filter((document) => document.url?.startsWith("kb://") || document.source === "internal-doc")
+      .slice(0, 6)
+      .map((document) => ({
+        title: document.title,
+        source: document.source,
+        url: document.url,
+        content: clip(document.content, 420),
+        scores: document.scores,
+        metadata: document.metadata,
+      }));
+    const externalDocuments = input.retrievalDocuments
+      .filter((document) => !document.url?.startsWith("kb://") && document.source !== "internal-doc")
+      .slice(0, 6)
+      .map((document) => ({
+        title: document.title,
+        source: document.source,
+        url: document.url,
+        content: clip(document.content, 420),
+        scores: document.scores,
+        metadata: document.metadata,
+      }));
 
     return [
       {
         role: "system" as const,
         content: [
-          "You are a helpful assistant inside a chat application.",
+          "You are an internal knowledge and training assistant for a company workspace.",
           "Answer in the same language as the user unless there is a strong reason not to.",
+          "Prefer practical, execution-ready answers over generic explanations.",
           "Use memory summary and recent conversation when helpful.",
           "Ground the answer in the highest quality retrieval evidence available.",
           "When evidence is weak, explicitly say uncertainty is high.",
+          isDirectScriptRequest
+            ? "For this request, use the answer structure: 标准话术, optional 补充说明, optional 来源."
+            : "Default answer structure: 结论, 适用范围/场景, 操作步骤或执行建议, 注意事项, 来源.",
+          "If the request is simple, keep the sections concise rather than forcing long prose.",
+          "When internal knowledge base documents are available, treat them as the primary source of truth for company policy, SOPs, onboarding, and training content.",
+          "When both internal documents and live web results are available, separate them explicitly as 内部依据 and 外部参考.",
+          "If external information has not yet been reflected in company policy, mark it as 待内部确认.",
           "When live web sources are available, cite the most useful source URLs in the answer.",
           "If web search completed with empty status, say that live search was attempted but current providers did not return enough reliable results.",
           "Do not claim that current news or events do not exist unless the retrieval evidence proves that.",
+          "Use only facts that are explicitly supported by the provided retrieval evidence.",
+          "Do not output placeholders such as [X], [具体时间], or [提及具体时间].",
+          "Do not add unverified process details, branch-specific handling, SLA numbers, ticket numbers, self-service lookup steps, compensation methods, or alternative flows unless the source explicitly contains them.",
+          "If a detail is missing from the sources, say so narrowly or keep the wording generic instead of filling in the gap.",
           "If structured presentation is appropriate, prefer clean Markdown headings and lists.",
           "Do not mention internal implementation details unless the user asks.",
           presentationStyleInstruction,
+          directScriptStyleInstruction,
         ].join(" "),
       },
       {
         role: "user" as const,
         content: JSON.stringify(
-          {
-            userMessage: clip(normalizeWhitespace(input.userMessage), 1_600),
-            memorySummary: input.memorySummary,
-            recentConversation: formatConversation(input.recentConversation),
-            retrievalDocuments: input.retrievalDocuments.slice(0, 6).map((document) => ({
-              title: document.title,
-              source: document.source,
-              url: document.url,
-              content: clip(document.content, 420),
-              scores: document.scores,
-            })),
-            searchResults: input.searchResults.slice(0, 4),
-            pageContents: input.pageContents.slice(0, 3),
-            toolResults: formatToolResults(input.toolResults),
-          },
+            {
+              userMessage: clip(normalizeWhitespace(input.userMessage), 1_600),
+              memorySummary: input.memorySummary,
+              recentConversation: formatConversation(input.recentConversation),
+              internalKnowledgeBaseDocuments: internalDocuments,
+              externalReferenceDocuments: externalDocuments,
+              searchResults: input.searchResults.slice(0, 4),
+              pageContents: input.pageContents.slice(0, 3),
+              toolResults: formatToolResults(input.toolResults),
+            },
           null,
           2,
         ),

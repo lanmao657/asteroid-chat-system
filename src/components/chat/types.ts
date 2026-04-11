@@ -15,11 +15,21 @@ export interface ActivityItem {
   createdAt: string;
 }
 
+export interface AssistantMessageMetadata extends Record<string, unknown> {
+  draftLength?: number;
+  finalMessageLength?: number;
+  kind?: string;
+  protectedLongDraft?: boolean;
+  runId?: string;
+  thoughts?: ActivityItem[];
+}
+
 export interface StreamingDraft {
   id: string;
   content: string;
   status: "streaming" | "stopped";
   createdAt: string;
+  thoughts?: ActivityItem[];
 }
 
 export interface PromptSuggestion {
@@ -30,3 +40,8 @@ export interface PromptSuggestion {
 }
 
 export type MessageListItem = ChatMessage;
+
+export const getMessageThoughts = (message: MessageListItem): ActivityItem[] => {
+  const thoughts = (message.metadata as AssistantMessageMetadata | undefined)?.thoughts;
+  return Array.isArray(thoughts) ? thoughts : [];
+};

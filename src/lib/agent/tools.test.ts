@@ -77,7 +77,7 @@ describe("searchWeb, knowledgeBaseSearch, fetchWebPage, and weatherLookup", () =
     process.env.JINA_API_KEY = "";
     const { searchKnowledgeBase } = await import("./tools");
     const result = await searchKnowledgeBase({
-      query: "knowledge base observability and rerank",
+      query: "报销制度和审批流程",
     });
 
     expect(result.provider).toBe("knowledge-base");
@@ -310,5 +310,82 @@ describe("searchWeb, knowledgeBaseSearch, fetchWebPage, and weatherLookup", () =
     ).toBe(true);
     expect(result.queryUsed).toBe("2024年 OpenAI 最新新闻");
     expect(result.results).toHaveLength(1);
+  });
+
+  it("assesses a strong matching sop plus unrelated docs as answer", async () => {
+    const { assessKnowledgeBaseRetrieval } = await import("./tools");
+    const assessment = assessKnowledgeBaseRetrieval({
+      query: "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+      documents: [
+        {
+          id: "refund-sop",
+          title: "客服退款争议处理 SOP",
+          source: "internal-doc",
+          url: "kb://enterprise/sop/customer-service-refund-dispute",
+          content:
+            "遇到退款争议时先确认订单状态、支付记录和退款规则，再向客户复述已核实的事实。可退场景应在 2 小时内发起退款申请，并同步预计到账时间。",
+          metadata: {
+            tags: ["客服", "退款", "SOP", "话术", "投诉"],
+          },
+          scores: { final: 0.92 },
+        },
+        {
+          id: "expense",
+          title: "员工费用报销制度",
+          source: "internal-doc",
+          content: "报销、审批、财务流程",
+          scores: { final: 0.31 },
+        },
+      ],
+    });
+
+    expect(assessment.decision).toBe("answer");
+    expect(assessment.decisionSource).toBe("retrieval-heuristic");
+    expect(assessment.coverageRatio).toBeGreaterThan(0.3);
+    expect(assessment.relevantDocumentCount).toBe(1);
+    expect(assessment.topDocument?.title).toBe("客服退款争议处理 SOP");
+  });
+
+  it("assesses weak fuzzy matches as rewrite", async () => {
+    const { assessKnowledgeBaseRetrieval } = await import("./tools");
+    const assessment = assessKnowledgeBaseRetrieval({
+      query: "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
+      documents: [
+        {
+          id: "weak",
+          title: "通用客服记录",
+          source: "internal-doc",
+          content: "这里有一些模糊相似但没有退款争议处理条目的内容。",
+          scores: { final: 0.64 },
+        },
+      ],
+    });
+
+    expect(assessment.decision).toBe("rewrite");
+    expect(assessment.coverageRatio).toBeLessThan(0.4);
+    expect(assessment.reason).toContain("no title/tag alignment");
+  });
+
+  it("assesses a top document without title tag alignment as rewrite", async () => {
+    const { assessKnowledgeBaseRetrieval } = await import("./tools");
+    const assessment = assessKnowledgeBaseRetrieval({
+      query: "请总结新版产品卖点与销售话术指引",
+      documents: [
+        {
+          id: "content-only",
+          title: "销售培训记录",
+          source: "internal-doc",
+          content: "这里提到了产品卖点和销售话术，但标题和标签没有直接对应。",
+          metadata: {
+            tags: ["培训"],
+          },
+          scores: { final: 0.77 },
+        },
+      ],
+    });
+
+    expect(assessment.decision).toBe("rewrite");
+    expect(assessment.topDocument?.titleTagHits).toEqual([]);
+    expect(assessment.reason).toContain("title/tag alignment");
   });
 });

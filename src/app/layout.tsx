@@ -19,9 +19,9 @@ const monoFont = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Asteroid Chat",
+  title: "北辰知识助手",
   description:
-    "Asteroid Chat 是一个桌面端智能对话工作台，保留 agent、检索与工具能力，同时提供更成熟的聊天产品体验。",
+    "北辰知识助手是一个面向企业培训、制度问答和内部知识检索的桌面端智能工作台。",
 };
 
 export default function RootLayout({
