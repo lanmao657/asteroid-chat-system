@@ -1,5 +1,6 @@
 import { listAgentRunLogs } from "@/lib/db/agent-run-log-repository";
 import { isDatabaseConfigured } from "@/lib/db/env";
+import { requireApiSession } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
@@ -13,6 +14,11 @@ const normalizeLimit = (value: string | null) => {
 };
 
 export async function GET(request: Request) {
+  const authResult = await requireApiSession(request);
+  if (authResult.response) {
+    return authResult.response;
+  }
+
   if (!isDatabaseConfigured()) {
     return Response.json(
       {

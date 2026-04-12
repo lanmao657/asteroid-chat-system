@@ -227,6 +227,37 @@
   gap: 12px;
 }
 
+.accountCard {
+  padding: 14px;
+  border: 1px solid var(--chat-border);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: var(--chat-shadow-soft);
+}
+
+.accountEyebrow {
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.accountName {
+  margin-top: 8px;
+  font-size: 0.94rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-strong);
+}
+
+.accountEmail {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
 .sidebarFooterCard {
   padding: 14px;
   border: 1px solid var(--chat-border);

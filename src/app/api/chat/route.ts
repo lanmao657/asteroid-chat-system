@@ -12,6 +12,7 @@ import {
   insertAgentRunLog,
   type PersistedAgentRunStatus,
 } from "@/lib/db/agent-run-log-repository";
+import { requireApiSession } from "@/lib/auth/session";
 import type {
   AgentRunTaskCategory,
   AgentStreamEvent,
@@ -99,6 +100,11 @@ const persistRunLogSafely = async ({
 };
 
 export async function POST(request: Request) {
+  const authResult = await requireApiSession(request);
+  if (authResult.response) {
+    return authResult.response;
+  }
+
   const payload = requestSchema.parse(await request.json());
   ensureSession(payload.sessionId);
 

@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { MessageSquarePlus, PanelLeftClose, Search, Settings2, Sparkles } from "lucide-react";
 
 import styles from "@/components/chat-workspace.module.css";
@@ -5,6 +7,9 @@ import type { SessionSummary } from "@/components/chat/types";
 
 interface AppSidebarProps {
   activeSessionId: string;
+  accountAction?: ReactNode;
+  accountEmail: string;
+  accountName: string;
   isCollapsed: boolean;
   isStreaming: boolean;
   onCollapse: () => void;
@@ -16,6 +21,9 @@ interface AppSidebarProps {
 
 export function AppSidebar({
   activeSessionId,
+  accountAction,
+  accountEmail,
+  accountName,
   formatTime,
   isCollapsed,
   isStreaming,
@@ -87,8 +95,14 @@ export function AppSidebar({
           <div className={styles.sidebarFooterEyebrow}>Enterprise</div>
           <div className={styles.sidebarFooterTitle}>企业培训与内部知识助手</div>
           <div className={styles.sidebarFooterBody}>
-            优先围绕制度、流程、培训和案例来组织知识问答与复盘。
+            优先围绕制度、流程、培训和案例来组织知识问答、复盘与检索。
           </div>
+        </div>
+
+        <div className={styles.accountCard}>
+          <div className={styles.accountEyebrow}>Account</div>
+          <div className={styles.accountName}>{accountName}</div>
+          <div className={styles.accountEmail}>{accountEmail}</div>
         </div>
 
         <button className={styles.sidebarUtility} type="button">
@@ -97,6 +111,8 @@ export function AppSidebar({
           </span>
           <span>知识库与权限预留</span>
         </button>
+
+        {accountAction}
       </div>
     </div>
   );
