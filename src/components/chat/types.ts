@@ -1,9 +1,13 @@
 import type { AgentRunTrace, ChatMessage, RetrievalStep } from "@/lib/agent/types";
+import type { SessionSummaryShape } from "@/lib/chat/sessions";
 
-export interface SessionSummary {
+export interface SessionSummary extends SessionSummaryShape {
   id: string;
   title: string;
-  updatedAt: number;
+  createdAt?: string;
+  updatedAt: string | number;
+  lastMessageAt?: string | null;
+  isDraft?: boolean;
 }
 
 export interface ActivityItem {

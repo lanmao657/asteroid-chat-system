@@ -2,17 +2,24 @@ import { z } from "zod";
 
 import { runAgentTurn } from "@/lib/agent/runtime";
 import {
-  appendSessionMessage,
-  ensureSession,
-  getSessionMemorySummary,
-  listSessionMessages,
-  setSessionMemorySummary,
-} from "@/lib/agent/session-store";
-import {
   insertAgentRunLog,
   type PersistedAgentRunStatus,
 } from "@/lib/db/agent-run-log-repository";
 import { requireApiSession } from "@/lib/auth/session";
+import {
+  appendMessage,
+  createSession,
+  getSessionById,
+  listMessagesBySession,
+  touchSessionLastMessageAt,
+  updateSessionSummary,
+  updateSessionTitle,
+} from "@/lib/db/chat-session-repository";
+import { DATABASE_NOT_CONFIGURED_MESSAGE, isDatabaseConfigured } from "@/lib/db/env";
+import {
+  DEFAULT_CHAT_SESSION_TITLE,
+  getChatSessionTitle,
+} from "@/lib/chat/sessions";
 import type {
   AgentRunTaskCategory,
   AgentStreamEvent,
@@ -21,7 +28,7 @@ import type {
 } from "@/lib/agent/types";
 
 const requestSchema = z.object({
-  sessionId: z.string().min(1),
+  sessionId: z.string().min(1).optional(),
   message: z.string().min(1),
 });
 
@@ -31,13 +38,29 @@ const toMessage = (
   role: ChatMessage["role"],
   content: string,
   metadata?: Record<string, unknown>,
+  options?: {
+    id?: string;
+    createdAt?: string;
+  },
 ): ChatMessage => ({
-  id: crypto.randomUUID(),
+  id: options?.id ?? crypto.randomUUID(),
   role,
   content,
-  createdAt: new Date().toISOString(),
+  createdAt: options?.createdAt ?? new Date().toISOString(),
   metadata,
 });
+
+const toChatMessage = (message: {
+  id: string;
+  role: ChatMessage["role"];
+  content: string;
+  createdAt: string;
+  metadata: Record<string, unknown>;
+}): ChatMessage =>
+  toMessage(message.role, message.content, message.metadata, {
+    id: message.id,
+    createdAt: message.createdAt,
+  });
 
 const formatSse = (event: AgentStreamEvent) =>
   `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
@@ -51,6 +74,14 @@ const createStreamHeaders = () => ({
 });
 
 export const runtime = "nodejs";
+
+const createJsonErrorResponse = (message: string, status: number) =>
+  Response.json(
+    {
+      error: message,
+    },
+    { status },
+  );
 
 const persistRunLogSafely = async ({
   runId,
@@ -105,8 +136,74 @@ export async function POST(request: Request) {
     return authResult.response;
   }
 
+  if (!isDatabaseConfigured()) {
+    return createJsonErrorResponse(DATABASE_NOT_CONFIGURED_MESSAGE, 503);
+  }
+
   const payload = requestSchema.parse(await request.json());
-  ensureSession(payload.sessionId);
+  const userId = authResult.session.user.id;
+  const requestedSessionId = payload.sessionId?.trim() || undefined;
+
+  let sessionRecord =
+    requestedSessionId == null
+      ? await createSession({
+          userId,
+        })
+      : await getSessionById({
+          sessionId: requestedSessionId,
+          userId,
+        });
+
+  if (!sessionRecord && requestedSessionId) {
+    sessionRecord = await createSession({
+      userId,
+      sessionId: requestedSessionId,
+    });
+  }
+
+  if (!sessionRecord) {
+    return createJsonErrorResponse(
+      requestedSessionId
+        ? "Chat session not found."
+        : "Failed to initialize the chat session.",
+      requestedSessionId ? 404 : 500,
+    );
+  }
+
+  const resolvedSessionId = sessionRecord.id;
+  const shouldUpdateTitle = sessionRecord.title === DEFAULT_CHAT_SESSION_TITLE;
+  const persistedUserMessage = await appendMessage({
+    sessionId: resolvedSessionId,
+    userId,
+    role: "user",
+    content: payload.message,
+  });
+
+  if (!persistedUserMessage) {
+    return createJsonErrorResponse("Failed to persist the user message.", 500);
+  }
+
+  if (shouldUpdateTitle) {
+    const nextTitle = getChatSessionTitle(payload.message);
+    const updatedTitle = await updateSessionTitle({
+      sessionId: resolvedSessionId,
+      userId,
+      title: nextTitle,
+    });
+
+    if (!updatedTitle) {
+      return createJsonErrorResponse("Failed to update the chat session title.", 500);
+    }
+
+    sessionRecord.title = nextTitle;
+  }
+
+  const persistedConversation = await listMessagesBySession({
+    sessionId: resolvedSessionId,
+    userId,
+  });
+  const conversation = persistedConversation.map(toChatMessage);
+  const memorySummary = sessionRecord.summary;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -133,14 +230,8 @@ export async function POST(request: Request) {
       };
 
       try {
-        const userMessage = toMessage("user", payload.message);
-        appendSessionMessage(payload.sessionId, userMessage);
-
-        const conversation = listSessionMessages(payload.sessionId);
-        const memorySummary = getSessionMemorySummary(payload.sessionId);
-
         const result = await runAgentTurn({
-          sessionId: payload.sessionId,
+          sessionId: resolvedSessionId,
           userMessage: payload.message,
           conversation,
           memorySummary,
@@ -149,24 +240,53 @@ export async function POST(request: Request) {
         });
 
         if (result.memorySummary !== memorySummary) {
-          setSessionMemorySummary(payload.sessionId, result.memorySummary);
+          const updatedSummary = await updateSessionSummary({
+            sessionId: resolvedSessionId,
+            userId,
+            summary: result.memorySummary,
+          });
+
+          if (!updatedSummary) {
+            throw new Error("Failed to persist the session summary.");
+          }
         }
 
         if (result.status === "completed") {
           if (result.trace) {
             emit({ type: "trace", trace: result.trace });
           }
+          const persistedAssistantMessage = await appendMessage({
+            sessionId: resolvedSessionId,
+            userId,
+            role: "assistant",
+            content: result.assistantText,
+            metadata: {
+              runId: result.runId,
+              trace: result.trace,
+            },
+          });
+
+          if (!persistedAssistantMessage) {
+            throw new Error("Failed to persist the assistant message.");
+          }
+
+          await touchSessionLastMessageAt({
+            sessionId: resolvedSessionId,
+          });
+
           const assistantMessage = toMessage("assistant", result.assistantText, {
             runId: result.runId,
             trace: result.trace,
+          }, {
+            id: persistedAssistantMessage.id,
+            createdAt: persistedAssistantMessage.createdAt,
           });
-          appendSessionMessage(payload.sessionId, assistantMessage);
           emit({ type: "assistant_final", message: assistantMessage });
         }
 
         await persistRunLogSafely({
           runId: result.runId,
-          sessionId: payload.sessionId,
+          sessionId: resolvedSessionId,
           provider: providerLabel || "unknown",
           taskCategory: result.taskCategory,
           status: result.status === "aborted" ? "aborted" : "completed",
@@ -189,13 +309,13 @@ export async function POST(request: Request) {
 
         await persistRunLogSafely({
           runId: currentRunId || crypto.randomUUID(),
-          sessionId: payload.sessionId,
+          sessionId: resolvedSessionId,
           provider: providerLabel || "unknown",
           taskCategory: "general",
           status: "errored",
           userMessage: payload.message,
           assistantMessage: "",
-          memorySummary: getSessionMemorySummary(payload.sessionId),
+          memorySummary,
           toolResults: [],
           errorMessage,
           startedAt,

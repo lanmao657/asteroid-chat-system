@@ -10,7 +10,7 @@
 - 前端主动停止生成
 - Assistant 回答的安全 Markdown 渲染
 
-当前会话、摘要和运行状态都只保存在进程内存中，服务重启后不会保留。
+当前聊天会话、聊天消息和摘要会持久化到 PostgreSQL，刷新页面后可以恢复历史；前端流式状态与运行中草稿仍是请求期 / 页面期状态。
 
 ## 启动
 
@@ -76,14 +76,18 @@ npm run typecheck
 ## PostgreSQL Persistence
 
 - PostgreSQL is wired on the server side only. The frontend chat UI and SSE contract stay unchanged.
-- The existing in-memory session store is kept as-is to avoid breaking the current chat/runtime flow.
-- The first persisted business object is `agent_run_logs`, which records one row per agent turn.
+- Protected chat now depends on PostgreSQL for session, message, and summary persistence.
+- `agent_run_logs` remains best-effort persistence for per-turn run telemetry.
 - Database access lives under `src/lib/db/`:
   - `env.ts`: database env parsing
   - `client.ts`: shared `pg` pool
   - `schema.ts`: lazy `CREATE TABLE IF NOT EXISTS`
-  - `agent-run-log-repository.ts`: insert/query repository
-- A verification route is available at `GET /api/agent-runs?sessionId=<id>&limit=10`
+  - `agent-run-log-repository.ts`: run log repository
+  - `chat-session-repository.ts`: chat session/message repository
+- Verification routes are available at:
+  - `GET /api/chat/sessions?limit=10`
+  - `GET /api/chat/sessions/<sessionId>/messages`
+  - `GET /api/agent-runs?sessionId=<id>&limit=10`
 
 ### Required env
 
@@ -96,7 +100,7 @@ DATABASE_IDLE_TIMEOUT_MS=30000
 DATABASE_CONNECTION_TIMEOUT_MS=5000
 ```
 
-If `DATABASE_URL` is missing, the app still runs and the chat flow still works, but run logs will not be persisted.
+If `DATABASE_URL` is missing, authentication, protected chat, chat history recovery, and run-log persistence are not available.
 
 ### Local PostgreSQL
 
@@ -120,7 +124,26 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -f sql/init-postgres.sql
 
 This project also lazily creates the table on first successful database write, so manual init is optional for local development.
 
-### Persisted table
+### Persisted tables
+
+`chat_sessions`
+
+- `id`: chat session identifier
+- `user_id`: owning user id from better-auth
+- `title`: current session title
+- `summary`: persisted memory summary used by the runtime
+- `next_message_sequence`: monotonic sequence counter for message ordering
+- `created_at` / `updated_at` / `last_message_at`: lifecycle timestamps
+
+`chat_messages`
+
+- `id`: chat message identifier
+- `session_id`: owning chat session id
+- `role`: `user` or `assistant`
+- `content`: final stored message text
+- `metadata`: JSONB metadata such as assistant trace/run id
+- `sequence_no`: stable message order within a session
+- `created_at`: message timestamp
 
 `agent_run_logs`
 
@@ -141,17 +164,31 @@ This project also lazily creates the table on first successful database write, s
 1. Start PostgreSQL and set `DATABASE_URL` in `.env.local`.
 2. Run `npm install`.
 3. Run `npm run dev`.
-4. Open `http://localhost:3000` and send one chat message.
-5. Query the persisted logs:
+4. Open `http://localhost:3000`, log in, and send one chat message.
+5. Query the persisted sessions:
+
+```bash
+curl "http://localhost:3000/api/chat/sessions?limit=5"
+```
+
+6. Query the messages for one returned session id:
+
+```bash
+curl "http://localhost:3000/api/chat/sessions/<sessionId>/messages"
+```
+
+7. Query the persisted logs:
 
 ```bash
 curl "http://localhost:3000/api/agent-runs?limit=5"
 ```
 
-You should see the latest run log row in JSON.
+You should see the latest persisted session, messages, and run log rows in JSON.
 
 You can also verify directly in PostgreSQL:
 
 ```bash
+psql postgresql://lanmao:550695@localhost:5432/mydb -c "select id, user_id, title, last_message_at from chat_sessions order by coalesce(last_message_at, updated_at) desc limit 5;"
+psql postgresql://lanmao:550695@localhost:5432/mydb -c "select session_id, sequence_no, role, created_at from chat_messages order by created_at desc limit 10;"
 psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_id, status, finished_at from agent_run_logs order by finished_at desc limit 5;"
 ```

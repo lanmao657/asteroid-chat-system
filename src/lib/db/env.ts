@@ -1,3 +1,5 @@
+export const DATABASE_NOT_CONFIGURED_MESSAGE = "DATABASE_URL is not configured on the server.";
+
 const asNumber = (value: string | undefined, fallback: number) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;

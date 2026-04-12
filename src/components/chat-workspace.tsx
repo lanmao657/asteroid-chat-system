@@ -31,6 +31,16 @@ import {
   formatToolStartedTitle,
   localizeTraceText,
 } from "@/lib/agent/trace-presentation";
+import {
+  buildChatSessionMessagesPath,
+  buildInitialSessionList,
+  DEFAULT_CHAT_SESSION_TITLE,
+  getChatSessionTitle,
+  hasComposerDraft,
+  mergePersistedSessions,
+  shouldPreserveLocalSessionState,
+  sortSessionsByActivity,
+} from "@/lib/chat/sessions";
 import type { AgentRunTrace, AgentStreamEvent, ChatMessage, RetrievalStep } from "@/lib/agent/types";
 
 interface ActiveRunState {
@@ -43,6 +53,15 @@ interface ChatWorkspaceProps {
     email: string;
     name: string;
   };
+}
+
+interface ChatSessionsResponse {
+  items: SessionSummary[];
+}
+
+interface ChatSessionMessagesResponse {
+  session: SessionSummary;
+  items: ChatMessage[];
 }
 
 const INITIAL_PROMPT = "";
@@ -90,8 +109,11 @@ const formatTime = (value: string | number) =>
 
 const createSession = (): SessionSummary => ({
   id: crypto.randomUUID(),
-  title: "新对话",
-  updatedAt: Date.now(),
+  title: DEFAULT_CHAT_SESSION_TITLE,
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  lastMessageAt: null,
+  isDraft: true,
 });
 
 const createLocalMessage = (
@@ -128,11 +150,6 @@ const createThoughtDraft = (current?: StreamingDraft): StreamingDraft => ({
   trace: current?.trace,
   thoughts: current?.thoughts ?? [],
 });
-
-const sessionTitleFrom = (message: string) => {
-  const compact = message.trim().replace(/\s+/g, " ");
-  return compact.length > 24 ? `${compact.slice(0, 24)}...` : compact || "新对话";
-};
 
 const normalizeProviderLabel = (label: string) => {
   if (label.includes("OpenAI")) {
@@ -175,6 +192,18 @@ const safeJson = (value: unknown) => {
     return JSON.stringify(value, null, 2);
   } catch {
     return "";
+  }
+};
+
+const getErrorMessageFromResponse = async (
+  response: Response,
+  fallback: string,
+) => {
+  try {
+    const payload = (await response.json()) as { error?: string };
+    return payload.error?.trim() || fallback;
+  } catch {
+    return fallback;
   }
 };
 
@@ -248,6 +277,11 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
   const [shouldAutoFollow, setShouldAutoFollow] = useState(true);
 
   const activeControllerRef = useRef<AbortController | null>(null);
+  const draftRef = useRef(INITIAL_PROMPT);
+  const historyInitializedRef = useRef(false);
+  const hasLocalSessionActivityRef = useRef(false);
+  const loadedSessionIdsRef = useRef(new Set<string>());
+  const loadingSessionIdsRef = useRef(new Set<string>());
   const streamingDraftBySessionRef = useRef<Record<string, StreamingDraft | undefined>>({
     [bootSession.id]: undefined,
   });
@@ -297,16 +331,35 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
 
   const upsertSession = (sessionId: string, title: string) => {
     setSessions((current) => {
+      const nextTimestamp = new Date().toISOString();
       const existing = current.find((session) => session.id === sessionId);
       if (!existing) {
-        return [{ id: sessionId, title, updatedAt: Date.now() }, ...current];
+        return sortSessionsByActivity([
+          {
+            id: sessionId,
+            title,
+            createdAt: nextTimestamp,
+            updatedAt: nextTimestamp,
+            lastMessageAt: nextTimestamp,
+            isDraft: false,
+          },
+          ...current,
+        ]);
       }
 
-      return current
-        .map((session) =>
-          session.id === sessionId ? { ...session, title, updatedAt: Date.now() } : session,
-        )
-        .sort((left, right) => right.updatedAt - left.updatedAt);
+      return sortSessionsByActivity(
+        current.map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                title,
+                updatedAt: nextTimestamp,
+                lastMessageAt: nextTimestamp,
+                isDraft: false,
+              }
+            : session,
+        ),
+      );
     });
   };
 
@@ -365,6 +418,169 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
       };
     });
   };
+
+  const markLocalSessionActivity = () => {
+    hasLocalSessionActivityRef.current = true;
+  };
+
+  const setComposerDraft = (value: string) => {
+    draftRef.current = value;
+    if (hasComposerDraft(value)) {
+      markLocalSessionActivity();
+    }
+    setDraft(value);
+  };
+
+  const markSessionAsLoaded = (sessionId: string) => {
+    loadedSessionIdsRef.current.add(sessionId);
+  };
+
+  const markSessionAsNeedingReload = (sessionId: string) => {
+    loadedSessionIdsRef.current.delete(sessionId);
+    loadingSessionIdsRef.current.delete(sessionId);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadSessions = async () => {
+      try {
+        const response = await fetch("/api/chat/sessions?limit=50");
+
+        if (response.status === 401) {
+          window.location.assign("/login");
+          return;
+        }
+
+        if (!response.ok) {
+          const errorMessage = await getErrorMessageFromResponse(
+            response,
+            "历史会话加载失败。",
+          );
+          if (!cancelled) {
+            setStatus(errorMessage);
+          }
+          return;
+        }
+
+        const payload = (await response.json()) as ChatSessionsResponse;
+        if (cancelled || historyInitializedRef.current) {
+          return;
+        }
+
+        historyInitializedRef.current = true;
+
+        if (
+          shouldPreserveLocalSessionState({
+            hasLocalSessionActivity: hasLocalSessionActivityRef.current,
+            draft: draftRef.current,
+          })
+        ) {
+          setSessions((current) => mergePersistedSessions(payload.items, current));
+        } else {
+          const nextState = buildInitialSessionList(payload.items, bootSession);
+          setSessions(nextState.sessions);
+          setActiveSessionId(nextState.activeSessionId);
+
+          if (payload.items.length > 0) {
+            setMessagesBySession({});
+            setStreamingDraftBySession({});
+            streamingDraftBySessionRef.current = {};
+            loadedSessionIdsRef.current = new Set();
+            loadingSessionIdsRef.current = new Set();
+          }
+        }
+
+        setStatus("企业知识助手已就绪");
+      } catch {
+        if (!cancelled) {
+          setStatus("历史会话加载失败。");
+        }
+      }
+    };
+
+    void loadSessions();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bootSession]);
+
+  useEffect(() => {
+    const activeSession = sessions.find((session) => session.id === activeSessionId);
+    if (!activeSession || activeSession.isDraft) {
+      return;
+    }
+
+    if (
+      loadedSessionIdsRef.current.has(activeSessionId) ||
+      loadingSessionIdsRef.current.has(activeSessionId)
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    loadingSessionIdsRef.current.add(activeSessionId);
+
+    const loadMessages = async () => {
+      try {
+        const response = await fetch(buildChatSessionMessagesPath(activeSessionId));
+
+        if (response.status === 401) {
+          window.location.assign("/login");
+          return;
+        }
+
+        if (!response.ok) {
+          const errorMessage = await getErrorMessageFromResponse(
+            response,
+            "历史消息加载失败。",
+          );
+          if (!cancelled) {
+            setStatus(errorMessage);
+          }
+          return;
+        }
+
+        const payload = (await response.json()) as ChatSessionMessagesResponse;
+        if (cancelled) {
+          return;
+        }
+
+        setMessagesBySession((current) => ({
+          ...current,
+          [activeSessionId]: payload.items,
+        }));
+        setSessions((current) =>
+          sortSessionsByActivity(
+            current.map((session) =>
+              session.id === payload.session.id
+                ? {
+                    ...session,
+                    ...payload.session,
+                    isDraft: false,
+                  }
+                : session,
+            ),
+          ),
+        );
+        markSessionAsLoaded(activeSessionId);
+        setStatus("历史消息已加载");
+      } catch {
+        if (!cancelled) {
+          setStatus("历史消息加载失败。");
+        }
+      } finally {
+        loadingSessionIdsRef.current.delete(activeSessionId);
+      }
+    };
+
+    void loadMessages();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, sessions]);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -692,9 +908,11 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
       return;
     }
 
+    markLocalSessionActivity();
     const sessionId = activeSessionId;
     const controller = new AbortController();
     activeControllerRef.current = controller;
+    markSessionAsLoaded(sessionId);
     clearStreamingDraft(sessionId);
     setProviderLabel("OpenAI Compatible");
     setStatus("正在提交请求...");
@@ -702,10 +920,11 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
 
     const userMessage = createLocalMessage("user", content);
     appendMessage(sessionId, userMessage);
-    upsertSession(sessionId, sessionTitleFrom(content));
-    setDraft("");
+    upsertSession(sessionId, getChatSessionTitle(content));
+    setComposerDraft("");
 
     try {
+      let receivedDoneEvent = false;
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -724,7 +943,10 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
       }
 
       if (!response.ok || !response.body) {
-        setStatus("无法连接到 /api/chat");
+        markSessionAsNeedingReload(sessionId);
+        setStatus(
+          await getErrorMessageFromResponse(response, "无法连接到 /api/chat"),
+        );
         setActiveRun(null);
         activeControllerRef.current = null;
         return;
@@ -751,10 +973,19 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
           }
 
           const event = JSON.parse(dataLine.slice(6)) as AgentStreamEvent;
+          if (event.type === "done") {
+            receivedDoneEvent = true;
+          }
           handleEvent(sessionId, event);
         }
       }
+      if (!receivedDoneEvent) {
+        markSessionAsNeedingReload(sessionId);
+        setActiveRun(null);
+        activeControllerRef.current = null;
+      }
     } catch (error) {
+      markSessionAsNeedingReload(sessionId);
       if (error instanceof DOMException && error.name === "AbortError") {
         setStatus("已停止");
         return;
@@ -785,8 +1016,10 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
       return;
     }
 
+    markLocalSessionActivity();
     startTransition(() => {
       const session = createSession();
+      markSessionAsNeedingReload(session.id);
       setSessions((current) => [session, ...current]);
       setActiveSessionId(session.id);
       setMessagesBySession((current) => ({
@@ -802,7 +1035,7 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
         return next;
       });
       setStatus("已新建一条知识会话。");
-      setDraft("");
+      setComposerDraft("");
       setProviderLabel("OpenAI Compatible");
       setShouldAutoFollow(true);
       focusComposer();
@@ -815,7 +1048,7 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
   };
 
   const handleSuggestionSelect = (prompt: string) => {
-    setDraft(prompt);
+    setComposerDraft(prompt);
     focusComposer();
   };
 
@@ -831,7 +1064,8 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
   };
 
   const activeTitle =
-    sessions.find((session) => session.id === activeSessionId)?.title ?? "新对话";
+    sessions.find((session) => session.id === activeSessionId)?.title ??
+    DEFAULT_CHAT_SESSION_TITLE;
 
   return (
     <div className={styles.shell} data-sidebar-open={isSidebarOpen}>
@@ -881,7 +1115,7 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
             <ChatInputPanel
               draft={draft}
               isStreaming={isStreaming}
-              onChange={setDraft}
+              onChange={setComposerDraft}
               onKeyDown={handleComposerKeyDown}
               onStop={stopCurrentRun}
               onSubmit={() => void submitPrompt()}

@@ -20,12 +20,13 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 认证前提与鉴权边界以 `src/lib/auth.ts`、`src/lib/auth/session.ts`、`src/app/api/auth/[...all]/route.ts` 为准。
 - 数据库前提与持久化行为以 `src/lib/db/*` 为准。
 - 聊天流式接口以 `src/app/api/chat/route.ts` 为准。
+- 聊天历史接口以 `src/app/api/chat/sessions/route.ts`、`src/app/api/chat/sessions/[sessionId]/messages/route.ts` 为准。
 - run log 查询接口以 `src/app/api/agent-runs/route.ts` 为准。
 
 ## 2. 项目事实
 
 - 技术栈：`Next.js 16.2.2 + React 19 + TypeScript + App Router`。
-- 主要能力：`better-auth` 认证、SSE 聊天流、agent runtime、web search、PostgreSQL run logs、Vitest 测试。
+- 主要能力：`better-auth` 认证、SSE 聊天流、agent runtime、web search、PostgreSQL 聊天持久化与 run logs、Vitest 测试。
 - UI 基础：Tailwind 4、`shadcn` 配置、`lucide-react`、`next/font`。
 - 路径别名：统一使用 `@/* -> src/*`。
 
@@ -41,6 +42,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 关键路径：
 
 - 聊天 API：`src/app/api/chat/route.ts`
+- 聊天历史 API：`src/app/api/chat/sessions/route.ts`、`src/app/api/chat/sessions/[sessionId]/messages/route.ts`
 - run log API：`src/app/api/agent-runs/route.ts`
 - Auth API：`src/app/api/auth/[...all]/route.ts`
 - 受保护首页：`src/app/(app)/page.tsx`
@@ -49,9 +51,11 @@ This version has breaking changes — APIs, conventions, and file structure may 
 运行语义：
 
 - `/api/chat` 是 `runtime = "nodejs"` 的 `SSE` 流式接口，返回协议基于 `ReadableStream`。
-- `/api/chat` 当前先做 `requireApiSession()` 鉴权，再执行 agent turn，并在结束后尝试持久化 run log。
+- `/api/chat` 当前先做 `requireApiSession()` 鉴权，再检查数据库配置；会话、消息、摘要写入 PostgreSQL 后再执行 agent turn，并在结束后继续尝试持久化 run log。
+- `/api/chat/sessions` 与 `/api/chat/sessions/[sessionId]/messages` 是鉴权后的历史查询接口，只返回当前登录用户自己的会话与消息。
 - `/api/agent-runs` 是鉴权后的服务端查询接口；缺少 `DATABASE_URL` 时会返回数据库未配置错误，不是匿名可访问接口。
 - 认证依赖 `better-auth + Kysely + PostgreSQL`；不要假设“没有数据库也能正常登录”。
+- 受保护聊天与历史恢复同样依赖 PostgreSQL；不要假设“没有数据库也能正常聊天，只是历史不保存”。
 - 路由边界固定为：`src/app/(app)` 是受保护区域，`src/app/(public)` 是登录/注册公共区域。
 - `src/lib/auth*`、`src/lib/db*`、其他带 `server-only` 的模块默认只允许在服务端边界内使用。
 
@@ -80,7 +84,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 生产构建入口：`npm run build`
 - 生产启动入口：`npm run start`
 - 当前项目的认证链路依赖数据库；本地开发若要完整验证登录、受保护页面、chat API 与 auth API，必须保证 `DATABASE_URL` 可用。
-- run log 持久化也依赖数据库；如果只验证前端静态 UI，可不走数据库链路，但这不代表认证可降级工作。
+- 聊天会话、消息、摘要与 run log 持久化都依赖数据库；如果只验证前端静态 UI，可不走数据库链路，但这不代表认证或受保护聊天可降级工作。
 
 ### 3.3 校验与测试
 
@@ -108,6 +112,12 @@ This version has breaking changes — APIs, conventions, and file structure may 
   - `src/components/chat-message-content.test.tsx`
 - 数据库与 run log 改动优先检查：
   - `src/lib/db/agent-run-log-repository.test.ts`
+  - `src/lib/db/chat-session-repository.test.ts`
+- 聊天历史接口与会话状态改动优先检查：
+  - `src/app/api/chat/route.test.ts`
+  - `src/app/api/chat/sessions/route.test.ts`
+  - `src/app/api/chat/sessions/[sessionId]/messages/route.test.ts`
+  - `src/lib/chat/sessions.test.ts`
 - web search 改动优先检查：
   - `src/tools/webSearch.test.ts`
 
@@ -120,6 +130,8 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 涉及认证、数据库、agent runtime、外部请求时，优先复用现有 helper、repository、env parsing、session helper，不平行重写第二套入口。
 - 前端继续沿用现有 `shadcn`、Tailwind 变量、字体和组件风格，不另起设计系统。
 - `/api/chat` 的 SSE 事件流、`runtime = "nodejs"` 前提、鉴权时机、run log 持久化时机如果变化，必须同步更新 `AGENTS.md`。
+- `/api/chat` 的数据库前提、会话/消息/摘要持久化时机如果变化，必须同步更新 `AGENTS.md`。
+- `/api/chat/sessions` 与 `/api/chat/sessions/[sessionId]/messages` 的鉴权要求、返回语义或数据库依赖如果变化，必须同步更新 `AGENTS.md`。
 - `/api/agent-runs` 的鉴权要求、查询参数、返回语义或数据库依赖如果变化，必须同步更新 `AGENTS.md`。
 - `(app)` 与 `(public)` 的访问边界、登录重定向规则、关键 env 前提如果变化，必须同步检查并更新：
   - `AGENTS.md`
@@ -132,6 +144,8 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 命令与 `package.json` 保持一致，没有引用不存在的脚本。
 - `BETTER_AUTH_URL`、`BETTER_AUTH_SECRET`、`DATABASE_URL` 的前提与当前代码一致。
 - `/api/chat` 的 SSE 契约、`runtime = "nodejs"`、鉴权边界没有被意外破坏。
+- `/api/chat` 仍然在数据库不可用时明确返回错误，不会静默降级到仅内存聊天。
+- `/api/chat/sessions` 与 `/api/chat/sessions/[sessionId]/messages` 仍然保持鉴权保护，且只返回当前用户自己的数据。
 - `/api/agent-runs` 仍然保持鉴权保护，且数据库未配置时的行为与文档描述一致。
 - 相关测试已运行；如果没有运行，必须在最终说明中写清原因和风险。
 - 文档变更没有机械复制 `README.md`，而是只保留长期有效的规则与工作流。
