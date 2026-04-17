@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { connection } from "next/server";
 
 import { AuthShell } from "@/components/auth/auth-shell";
 import { redirectIfAuthenticated } from "@/lib/auth/session";
@@ -9,6 +10,7 @@ export const metadata: Metadata = {
 };
 
 export default async function LoginPage() {
+  await connection();
   await redirectIfAuthenticated();
 
   return <AuthShell mode="login" />;

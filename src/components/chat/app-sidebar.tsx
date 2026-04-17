@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import Link from "next/link";
 
 import { MessageSquarePlus, PanelLeftClose, Search, Settings2, Sparkles } from "lucide-react";
 
@@ -7,9 +7,6 @@ import type { SessionSummary } from "@/components/chat/types";
 
 interface AppSidebarProps {
   activeSessionId: string;
-  accountAction?: ReactNode;
-  accountEmail: string;
-  accountName: string;
   isCollapsed: boolean;
   isStreaming: boolean;
   onCollapse: () => void;
@@ -21,9 +18,6 @@ interface AppSidebarProps {
 
 export function AppSidebar({
   activeSessionId,
-  accountAction,
-  accountEmail,
-  accountName,
   formatTime,
   isCollapsed,
   isStreaming,
@@ -41,7 +35,7 @@ export function AppSidebar({
               <Sparkles size={16} strokeWidth={2.1} />
             </div>
             <div>
-              <div className={styles.logoTitle}>北辰知识助手</div>
+              <div className={styles.logoTitle}>内部知识助手</div>
               <div className={styles.logoSub}>企业培训、制度问答与内部知识检索工作台</div>
             </div>
           </div>
@@ -99,20 +93,12 @@ export function AppSidebar({
           </div>
         </div>
 
-        <div className={styles.accountCard}>
-          <div className={styles.accountEyebrow}>Account</div>
-          <div className={styles.accountName}>{accountName}</div>
-          <div className={styles.accountEmail}>{accountEmail}</div>
-        </div>
-
-        <button className={styles.sidebarUtility} type="button">
+        <Link className={styles.sidebarUtility} href="/settings">
           <span className={styles.sidebarUtilityIcon}>
             <Settings2 size={15} />
           </span>
-          <span>知识库与权限预留</span>
-        </button>
-
-        {accountAction}
+          <span>设置</span>
+        </Link>
       </div>
     </div>
   );

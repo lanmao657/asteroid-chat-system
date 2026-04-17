@@ -97,6 +97,31 @@ export interface RetrievalDocument {
   };
 }
 
+export type KnowledgeSourceType = "knowledge_base";
+
+export interface KnowledgeChunkSearchResult {
+  documentId: string;
+  documentTitle: string;
+  chunkId: string;
+  chunkIndex: number;
+  content: string;
+  score: number;
+  rerankScore?: number;
+  sourceType: KnowledgeSourceType;
+  snippet?: string;
+}
+
+export interface AssistantCitation {
+  citationId: string;
+  sourceType: KnowledgeSourceType;
+  documentId: string;
+  documentTitle: string;
+  chunkId: string;
+  chunkIndex: number;
+  snippet: string;
+  score?: number;
+}
+
 export interface WeatherResult {
   location: string;
   summary: string;
@@ -173,7 +198,7 @@ export interface AgentRunTrace {
   route: RetrievalRoute;
   originalQuery: string;
   finalQuery: string;
-  searchStrategy?: "hybrid" | "dense-only";
+  searchStrategy?: "hybrid" | "dense-only" | "fts" | "keyword";
   grading?: KnowledgeBaseRetrievalAssessment;
   rewrite?: QueryRewriteResult;
   retrievedDocuments: Array<{
@@ -212,6 +237,7 @@ export interface AgentState {
   taskCategory: AgentRunTaskCategory;
   status: "running" | "completed" | "aborted" | "errored";
   assistantText: string;
+  citations: AssistantCitation[];
   trace?: AgentRunTrace;
 }
 

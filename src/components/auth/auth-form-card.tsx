@@ -1,9 +1,8 @@
 "use client";
 
-import { startTransition, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 
 import { LoaderCircle } from "lucide-react";
 
@@ -49,7 +48,6 @@ export function AuthFormCard({
   onPasswordFocusChange,
   onPendingChange,
 }: AuthFormCardProps) {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -111,10 +109,7 @@ export function AuthFormCard({
         return;
       }
 
-      startTransition(() => {
-        router.replace("/");
-        router.refresh();
-      });
+      window.location.assign("/");
     } catch (submissionError) {
       setError(
         submissionError instanceof Error

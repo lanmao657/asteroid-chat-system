@@ -3,6 +3,8 @@ import { getDbPool } from "@/lib/db/client";
 export const AGENT_RUN_LOGS_TABLE = "agent_run_logs";
 export const CHAT_SESSIONS_TABLE = "chat_sessions";
 export const CHAT_MESSAGES_TABLE = "chat_messages";
+export const KNOWLEDGE_DOCUMENTS_TABLE = "knowledge_documents";
+export const KNOWLEDGE_CHUNKS_TABLE = "knowledge_chunks";
 
 export const AGENT_RUN_LOGS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS ${AGENT_RUN_LOGS_TABLE} (
@@ -62,6 +64,58 @@ CREATE INDEX IF NOT EXISTS chat_messages_session_id_sequence_no_idx
   ON ${CHAT_MESSAGES_TABLE} (session_id, sequence_no ASC);
 `;
 
+export const KNOWLEDGE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS ${KNOWLEDGE_DOCUMENTS_TABLE} (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  original_filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  file_size BIGINT NOT NULL,
+  extracted_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('uploaded', 'parsed', 'chunked', 'failed')) DEFAULT 'uploaded',
+  error_message TEXT,
+  chunk_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ${KNOWLEDGE_CHUNKS_TABLE} (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES ${KNOWLEDGE_DOCUMENTS_TABLE}(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  char_count INTEGER NOT NULL,
+  embedding_status TEXT NOT NULL CHECK (embedding_status IN ('pending', 'ready', 'failed')) DEFAULT 'pending',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_user_id_updated_at_idx
+  ON ${KNOWLEDGE_DOCUMENTS_TABLE} (user_id, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_user_id_status_updated_at_idx
+  ON ${KNOWLEDGE_DOCUMENTS_TABLE} (user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_document_id_chunk_index_idx
+  ON ${KNOWLEDGE_CHUNKS_TABLE} (document_id, chunk_index ASC);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_user_id_document_id_idx
+  ON ${KNOWLEDGE_CHUNKS_TABLE} (user_id, document_id);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_user_id_embedding_status_created_at_idx
+  ON ${KNOWLEDGE_CHUNKS_TABLE} (user_id, embedding_status, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_title_idx
+  ON ${KNOWLEDGE_DOCUMENTS_TABLE} (title);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_content_fts_idx
+  ON ${KNOWLEDGE_CHUNKS_TABLE}
+  USING GIN (to_tsvector('simple', content));
+`;
+
 let schemaReadyPromise: Promise<void> | null = null;
 
 export const ensureDatabaseSchema = async () => {
@@ -72,7 +126,7 @@ export const ensureDatabaseSchema = async () => {
 
   if (!schemaReadyPromise) {
     schemaReadyPromise = pool
-      .query(`${AGENT_RUN_LOGS_SCHEMA_SQL}\n${CHAT_SCHEMA_SQL}`)
+      .query(`${AGENT_RUN_LOGS_SCHEMA_SQL}\n${CHAT_SCHEMA_SQL}\n${KNOWLEDGE_SCHEMA_SQL}`)
       .then(() => undefined)
       .catch((error) => {
         schemaReadyPromise = null;

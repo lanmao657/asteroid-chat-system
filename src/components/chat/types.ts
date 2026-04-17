@@ -1,4 +1,9 @@
-import type { AgentRunTrace, ChatMessage, RetrievalStep } from "@/lib/agent/types";
+import type {
+  AgentRunTrace,
+  AssistantCitation,
+  ChatMessage,
+  RetrievalStep,
+} from "@/lib/agent/types";
 import type { SessionSummaryShape } from "@/lib/chat/sessions";
 
 export interface SessionSummary extends SessionSummaryShape {
@@ -25,6 +30,7 @@ export interface AssistantMessageMetadata extends Record<string, unknown> {
   kind?: string;
   protectedLongDraft?: boolean;
   runId?: string;
+  citations?: AssistantCitation[];
   trace?: AgentRunTrace;
   thoughts?: ActivityItem[];
 }
@@ -69,3 +75,8 @@ export const getMessageThoughts = (message: MessageListItem): ActivityItem[] => 
 
 export const getMessageTrace = (message: MessageListItem): AgentRunTrace | undefined =>
   (message.metadata as AssistantMessageMetadata | undefined)?.trace;
+
+export const getMessageCitations = (message: MessageListItem): AssistantCitation[] => {
+  const citations = (message.metadata as AssistantMessageMetadata | undefined)?.citations;
+  return Array.isArray(citations) ? citations : [];
+};

@@ -858,6 +858,72 @@
   line-height: 1.6;
 }
 
+.citationBlock {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(17, 17, 17, 0.06);
+}
+
+.citationTitle {
+  color: var(--ink-faint);
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.citationList {
+  display: grid;
+  gap: 8px;
+}
+
+.citationCard {
+  display: grid;
+  gap: 6px;
+  padding: 12px 13px;
+  border: 1px solid rgba(17, 17, 17, 0.06);
+  border-radius: 16px;
+  background: rgba(247, 247, 243, 0.78);
+}
+
+.citationCardHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.citationDocumentTitle {
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.citationMeta {
+  flex-shrink: 0;
+  color: var(--ink-faint);
+  font-size: 0.73rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.citationSnippet,
+.citationMoreSummary {
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.citationMore {
+  display: grid;
+  gap: 8px;
+}
+
+.citationMoreSummary {
+  cursor: pointer;
+  list-style: none;
+}
+
 .composerDock {
   padding-top: 18px;
 }

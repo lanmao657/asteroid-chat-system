@@ -1,11 +1,12 @@
 ﻿import * as cheerio from "cheerio";
 
 import { agentEnv } from "@/lib/agent/env";
-import { knowledgeBaseDocuments } from "@/lib/agent/knowledge-base";
+import { searchKnowledgeChunksByUser } from "@/lib/db/knowledge-repository";
 import { webSearch, WebSearchError } from "@/tools/webSearch";
 import type {
   FetchedPage,
   KnowledgeBaseRetrievalAssessment,
+  KnowledgeChunkSearchResult,
   RetrievalDocument,
   SearchProviderName,
   SearchResult,
@@ -50,8 +51,11 @@ export interface SearchResponse {
 export interface KnowledgeBaseSearchResponse {
   provider: "knowledge-base";
   documents: RetrievalDocument[];
-  strategy: "hybrid" | "dense-only";
+  rawResults: KnowledgeChunkSearchResult[];
+  strategy: "fts" | "keyword" | "hybrid";
   reranked: boolean;
+  filteredOutCount: number;
+  rerankSkippedReason?: string;
 }
 
 const SEARCH_PROVIDER_ORDER: SearchProviderName[] = [
@@ -311,53 +315,6 @@ const extractDomain = (rawUrl: string) => {
   }
 };
 
-const tokenize = (value: string) =>
-  normalizeWhitespace(value)
-    .toLowerCase()
-    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
-    .filter(Boolean);
-
-const buildCharGrams = (value: string, size = 2) => {
-  const compact = normalizeWhitespace(value).toLowerCase().replace(/\s+/g, "");
-  const grams: string[] = [];
-
-  for (let index = 0; index <= compact.length - size; index += 1) {
-    grams.push(compact.slice(index, index + size));
-  }
-
-  return grams.length > 0 ? grams : compact ? [compact] : [];
-};
-
-const cosineFromCounters = (left: Map<string, number>, right: Map<string, number>) => {
-  let dot = 0;
-  let leftNorm = 0;
-  let rightNorm = 0;
-
-  for (const [token, leftValue] of left.entries()) {
-    const rightValue = right.get(token) ?? 0;
-    dot += leftValue * rightValue;
-    leftNorm += leftValue * leftValue;
-  }
-
-  for (const rightValue of right.values()) {
-    rightNorm += rightValue * rightValue;
-  }
-
-  if (leftNorm === 0 || rightNorm === 0) {
-    return 0;
-  }
-
-  return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
-};
-
-const buildCounter = (tokens: string[]) => {
-  const counter = new Map<string, number>();
-  for (const token of tokens) {
-    counter.set(token, (counter.get(token) ?? 0) + 1);
-  }
-  return counter;
-};
-
 const unique = <T>(values: T[]) => Array.from(new Set(values));
 
 const normalizeForMatch = (value: string) =>
@@ -415,8 +372,103 @@ const extractKnowledgeQueryTerms = (query: string, corpusTexts: string[]) => {
   return selected;
 };
 
-const reciprocalRankFusion = (...ranks: number[]) =>
-  ranks.reduce((total, rank) => total + 1 / (60 + rank), 0);
+const toRetrievalDocument = (result: KnowledgeChunkSearchResult): RetrievalDocument => ({
+  id: result.chunkId,
+  title: result.documentTitle,
+  source: "internal-doc",
+  url: `kb://${result.documentId}/${result.chunkId}`,
+  content: result.content,
+  metadata: {
+    documentId: result.documentId,
+    chunkId: result.chunkId,
+    chunkIndex: result.chunkIndex,
+    documentTitle: result.documentTitle,
+    snippet: result.snippet,
+    sourceType: result.sourceType,
+  },
+  scores: {
+    rerank: result.rerankScore,
+    final: result.rerankScore ?? result.score,
+  },
+});
+
+const rerankKnowledgeResults = async ({
+  query,
+  results,
+  signal,
+}: {
+  query: string;
+  results: KnowledgeChunkSearchResult[];
+  signal?: AbortSignal;
+}) => {
+  if (
+    results.length === 0 ||
+    !agentEnv.knowledgeBaseEnableRerank ||
+    !agentEnv.jinaApiKey
+  ) {
+    return {
+      reranked: false,
+      rerankSkippedReason: !agentEnv.knowledgeBaseEnableRerank
+        ? "rerank_disabled"
+        : !agentEnv.jinaApiKey
+          ? "missing_jina_api_key"
+          : "no_results",
+      results,
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      (innerSignal) =>
+        fetch("https://api.jina.ai/v1/rerank", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${agentEnv.jinaApiKey}`,
+          },
+          body: JSON.stringify({
+            model: agentEnv.jinaRerankModel,
+            query,
+            documents: results.map((result) => result.content),
+          }),
+          signal: innerSignal,
+        }),
+      agentEnv.webFetchTimeoutMs,
+      signal,
+    );
+
+    if (!response.ok) {
+      throw new Error(`Jina rerank failed with status ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      results?: Array<{ index: number; relevance_score: number }>;
+    };
+    const scoreMap = new Map<number, number>();
+    for (const item of payload.results ?? []) {
+      scoreMap.set(item.index, item.relevance_score);
+    }
+
+    return {
+      reranked: true,
+      results: results
+        .map((result, index) => ({
+          ...result,
+          rerankScore: scoreMap.get(index) ?? result.score,
+        }))
+        .sort(
+          (left, right) =>
+            (right.rerankScore ?? right.score) - (left.rerankScore ?? left.score),
+        ),
+    };
+  } catch {
+    return {
+      reranked: false,
+      rerankSkippedReason: "rerank_failed",
+      results,
+    };
+  }
+};
 
 const matchesDomainList = (domain: string, list: string[]) =>
   list.some((item) => domain === item || domain.endsWith(`.${item}`));
@@ -1141,208 +1193,103 @@ export const fetchWebPage = async ({
 };
 
 export const searchKnowledgeBase = async ({
+  userId,
   query,
   signal,
   onProgress,
 }: {
+  userId: string;
   query: string;
   signal?: AbortSignal;
   onProgress?: (progress: ToolProgress) => void;
 }): Promise<KnowledgeBaseSearchResponse> => {
   throwIfAborted(signal);
 
-  const queryTokens = tokenize(query);
-  const queryGrams = buildCounter(buildCharGrams(query));
-  const avgDocLength =
-    knowledgeBaseDocuments.reduce(
-      (total, document) => total + tokenize(`${document.title} ${document.content}`).length,
-      0,
-    ) / Math.max(knowledgeBaseDocuments.length, 1);
-
   onProgress?.({
     callId: "",
     tool: "knowledgeBaseSearch",
-    message: "Running hybrid retrieval (sparse + dense)",
+    message: "Running knowledge retrieval",
     provider: "knowledge-base",
   });
 
-  let strategy: "hybrid" | "dense-only" = "hybrid";
-  let documents: RetrievalDocument[] = [];
-
   try {
-    const sparseRanked = knowledgeBaseDocuments
-      .map((document) => {
-        const docTokens = tokenize(`${document.title} ${document.content} ${document.tags.join(" ")}`);
-        const sparseScore = queryTokens.reduce((score, token) => {
-          const tf = docTokens.filter((item) => item === token).length;
-          if (tf === 0) {
-            return score;
-          }
-
-          const df = knowledgeBaseDocuments.filter((candidate) =>
-            tokenize(`${candidate.title} ${candidate.content} ${candidate.tags.join(" ")}`).includes(
-              token,
-            ),
-          ).length;
-          const idf = Math.log(1 + (knowledgeBaseDocuments.length - df + 0.5) / (df + 0.5));
-          const k1 = 1.5;
-          const b = 0.75;
-          return (
-            score +
-            (idf * tf * (k1 + 1)) /
-              (tf + k1 * (1 - b + b * (docTokens.length / Math.max(avgDocLength, 1))))
-          );
-        }, 0);
-
-        const denseScore = cosineFromCounters(
-          queryGrams,
-          buildCounter(buildCharGrams(`${document.title} ${document.content}`)),
-        );
-
-        return { document, sparseScore, denseScore };
-      })
-      .sort((left, right) => right.sparseScore - left.sparseScore);
-
-    const denseRanked = [...sparseRanked].sort((left, right) => right.denseScore - left.denseScore);
-
-    documents = knowledgeBaseDocuments
-      .map((document) => {
-        const sparseRank = sparseRanked.findIndex((entry) => entry.document.id === document.id) + 1;
-        const denseRank = denseRanked.findIndex((entry) => entry.document.id === document.id) + 1;
-        const sparseScore = sparseRanked.find((entry) => entry.document.id === document.id)?.sparseScore ?? 0;
-        const denseScore = denseRanked.find((entry) => entry.document.id === document.id)?.denseScore ?? 0;
-
-        return {
-          id: document.id,
-          title: document.title,
-          source: document.source,
-          url: document.url,
-          content: document.content,
-          metadata: {
-            tags: document.tags,
-            category: document.category,
-            department: document.department,
-            applicableRoles: document.applicableRoles,
-            updatedAt: document.updatedAt,
-          },
-          scores: {
-            sparse: sparseScore,
-            dense: denseScore,
-            rrf: reciprocalRankFusion(sparseRank, denseRank),
-            final: reciprocalRankFusion(sparseRank, denseRank),
-          },
-        } satisfies RetrievalDocument;
-      })
-      .sort((left, right) => right.scores.final - left.scores.final)
-      .slice(0, agentEnv.knowledgeBaseMaxResults);
-  } catch {
-    strategy = "dense-only";
-    onProgress?.({
-      callId: "",
-      tool: "knowledgeBaseSearch",
-      message: "Hybrid retrieval degraded to dense-only retrieval",
-      provider: "knowledge-base",
+    const strategy =
+      agentEnv.knowledgeBaseSearchMode === "vector"
+        ? "hybrid"
+        : agentEnv.knowledgeBaseSearchMode;
+    const rawResults = await searchKnowledgeChunksByUser({
+      userId,
+      query,
+      topK: agentEnv.knowledgeBaseMaxResults,
+      minScore: 0,
+      mode: strategy,
     });
 
-    documents = knowledgeBaseDocuments
-      .map((document) => {
-        const denseScore = cosineFromCounters(
-          queryGrams,
-          buildCounter(buildCharGrams(`${document.title} ${document.content}`)),
-        );
-
-        return {
-          id: document.id,
-          title: document.title,
-          source: document.source,
-          url: document.url,
-          content: document.content,
-          metadata: {
-            tags: document.tags,
-            category: document.category,
-            department: document.department,
-            applicableRoles: document.applicableRoles,
-            updatedAt: document.updatedAt,
-          },
-          scores: {
-            dense: denseScore,
-            final: denseScore,
-          },
-        } satisfies RetrievalDocument;
-      })
-      .sort((left, right) => right.scores.final - left.scores.final)
-      .slice(0, agentEnv.knowledgeBaseMaxResults);
-  }
-
-  let reranked = false;
-  if (documents.length > 0 && agentEnv.jinaApiKey) {
-    onProgress?.({
-      callId: "",
-      tool: "knowledgeBaseSearch",
-      message: "Calling Jina rerank",
-      provider: "knowledge-base",
-    });
-
-    try {
-      const response = await withTimeout(
-        (innerSignal) =>
-          fetch("https://api.jina.ai/v1/rerank", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${agentEnv.jinaApiKey}`,
-            },
-            body: JSON.stringify({
-              model: agentEnv.jinaRerankModel,
-              query,
-              documents: documents.map((document) => document.content),
-            }),
-            signal: innerSignal,
-          }),
-        agentEnv.webFetchTimeoutMs,
-        signal,
-      );
-
-      if (!response.ok) {
-        throw new Error(`Jina rerank failed with status ${response.status}`);
-      }
-
-      const payload = (await response.json()) as {
-        results?: Array<{ index: number; relevance_score: number }>;
-      };
-
-      const scoreMap = new Map<number, number>();
-      for (const item of payload.results ?? []) {
-        scoreMap.set(item.index, item.relevance_score);
-      }
-
-      documents = documents
-        .map((document, index) => ({
-          ...document,
-          scores: {
-            ...document.scores,
-            rerank: scoreMap.get(index) ?? document.scores.final,
-            final: scoreMap.get(index) ?? document.scores.final,
-          },
-        }))
-        .sort((left, right) => right.scores.final - left.scores.final);
-      reranked = true;
-    } catch {
+    if (rawResults.length > 0) {
       onProgress?.({
         callId: "",
         tool: "knowledgeBaseSearch",
-        message: "Jina rerank failed, keeping the local hybrid ranking",
+        message: "Scored knowledge candidates",
         provider: "knowledge-base",
+        detail: JSON.stringify({
+          searchMode: strategy,
+          rawCandidateCount: rawResults.length,
+          minScore: agentEnv.knowledgeBaseMinScore,
+        }),
       });
     }
-  }
 
-  return {
-    provider: "knowledge-base",
-    documents,
-    strategy,
-    reranked,
-  };
+    const rerankResponse = await rerankKnowledgeResults({
+      query,
+      results: rawResults,
+      signal,
+    });
+
+    if (rawResults.length > 0 && rerankResponse.reranked) {
+      onProgress?.({
+        callId: "",
+        tool: "knowledgeBaseSearch",
+        message: "Calling Jina rerank",
+        provider: "knowledge-base",
+      });
+    } else if (rerankResponse.rerankSkippedReason) {
+      onProgress?.({
+        callId: "",
+        tool: "knowledgeBaseSearch",
+        message: "Skipping rerank",
+        provider: "knowledge-base",
+        detail: rerankResponse.rerankSkippedReason,
+      });
+    }
+
+    const filteredResults = rerankResponse.results
+      .filter(
+        (result) =>
+          (result.rerankScore ?? result.score) >= agentEnv.knowledgeBaseMinScore,
+      )
+      .slice(0, agentEnv.knowledgeBaseMaxResults);
+
+    return {
+      provider: "knowledge-base",
+      rawResults,
+      documents: filteredResults.map(toRetrievalDocument),
+      strategy,
+      reranked: rerankResponse.reranked,
+      filteredOutCount: Math.max(rawResults.length - filteredResults.length, 0),
+      rerankSkippedReason: rerankResponse.rerankSkippedReason,
+    };
+  } catch (error) {
+    if (error instanceof SearchToolError) {
+      throw error;
+    }
+
+    throw new SearchToolError(
+      "Knowledge-base retrieval failed.",
+      isAbortError(error) ? "aborted" : "unknown",
+      "knowledge-base",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 };
 
 export const assessKnowledgeBaseRetrieval = ({
@@ -1352,20 +1299,13 @@ export const assessKnowledgeBaseRetrieval = ({
   query: string;
   documents: RetrievalDocument[];
 }): KnowledgeBaseRetrievalAssessment => {
-  const queryTerms = extractKnowledgeQueryTerms(query, [
-    ...knowledgeBaseDocuments.map(
-      (document) => `${document.title} ${document.tags.join(" ")} ${document.content}`,
-    ),
-    ...documents.map(
-      (document) =>
-        `${document.title} ${String((document.metadata?.tags as string[] | undefined)?.join(" ") ?? "")} ${document.content}`,
-    ),
-  ]);
+  const queryTerms = extractKnowledgeQueryTerms(
+    query,
+    documents.map((document) => `${document.title} ${document.content}`),
+  );
 
   const documentMetrics = documents.map((document) => {
-    const titleTagHaystack = normalizeForMatch(
-      `${document.title} ${String((document.metadata?.tags as string[] | undefined)?.join(" ") ?? "")}`,
-    );
+    const titleTagHaystack = normalizeForMatch(document.title);
     const contentHaystack = normalizeForMatch(document.content);
     const titleTagHits = queryTerms.filter((term) => titleTagHaystack.includes(term));
     const contentHits = queryTerms.filter(
@@ -1391,12 +1331,13 @@ export const assessKnowledgeBaseRetrieval = ({
   const topGap = topMetric
     ? topMetric.overlapCount - (secondMetric?.overlapCount ?? 0)
     : 0;
+  const requiredTitleHits = queryTerms.length <= 2 ? 1 : 2;
 
   let decision: KnowledgeBaseRetrievalAssessment["decision"] = "rewrite";
   if (
     topMetric &&
     queryTerms.length > 0 &&
-    topMetric.titleTagHits.length > 0 &&
+    topMetric.titleTagHits.length >= requiredTitleHits &&
     coverageRatio >= 0.4 &&
     relevantDocumentCount >= 1 &&
     topGap >= 1

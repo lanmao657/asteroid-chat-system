@@ -39,8 +39,47 @@ describe("MessageList", () => {
     );
 
     expect(html).toContain("assistantBubble");
-    expect(html).toContain("思考过程");
+    expect(html).toContain("Searching");
     expect(html).toContain("最终回答正文");
+  });
+
+  it("renders citations under assistant messages without changing markdown content", () => {
+    const messages: MessageListItem[] = [
+      {
+        id: "assistant-2",
+        role: "assistant",
+        content: "这是带来源的回答。",
+        createdAt: new Date().toISOString(),
+        metadata: {
+          citations: [
+            {
+              citationId: "doc-1:chunk-1",
+              sourceType: "knowledge_base",
+              documentId: "doc-1",
+              documentTitle: "退款处理 SOP",
+              chunkId: "chunk-1",
+              chunkIndex: 2,
+              snippet: "先确认订单状态，再同步退款到账时效。",
+              score: 0.88,
+            },
+          ],
+        },
+      },
+    ];
+
+    const html = renderToStaticMarkup(
+      <MessageList
+        emptyState={<div>empty</div>}
+        formatTime={formatTime}
+        messages={messages}
+        timelineRef={createRef<HTMLDivElement>()}
+      />,
+    );
+
+    expect(html).toContain("这是带来源的回答。");
+    expect(html).toContain("来源引用");
+    expect(html).toContain("退款处理 SOP");
+    expect(html).toContain("片段 #3");
   });
 
   it("shows the streaming draft as one assistant bubble that contains thought state and streamed content", () => {
@@ -70,8 +109,7 @@ describe("MessageList", () => {
       />,
     );
 
-    expect(html).toContain("思考过程");
-    expect(html).toContain("回答中");
+    expect(html).toContain("Grading");
     expect(html).toContain("正在输出正文");
   });
 
@@ -103,7 +141,7 @@ describe("MessageList", () => {
     );
 
     expect(html).toContain('data-phase="stopped"');
-    expect(html).toContain("已停止生成");
-    expect(html).toContain("已停止");
+    expect(html).toContain("Searching");
+    expect(html).toContain("已经输出了一半");
   });
 });

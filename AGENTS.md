@@ -76,6 +76,16 @@ This version has breaking changes — APIs, conventions, and file structure may 
   - `TAVILY_API_KEY`
   - `SEARCH_API_KEY`
   - `SEARCH_PROVIDERS`
+- 涉及知识入库或内部知识检索时，再核对：
+  - `KNOWLEDGE_BASE_CHUNK_SIZE`
+  - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
+  - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+  - `KNOWLEDGE_BASE_MAX_RESULTS`
+  - `KNOWLEDGE_BASE_MIN_SCORE`
+  - `KNOWLEDGE_BASE_ENABLE_RERANK`
+  - `KNOWLEDGE_BASE_SEARCH_MODE`
+  - `JINA_API_KEY`
+  - `JINA_RERANK_MODEL`
 - 只改环境变量名、默认值或是否必填的行为时，必须同步检查 `.env.example`、`README.md`、`AGENTS.md`。
 
 ### 3.2 启动
@@ -158,3 +168,62 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 发现仓库已有清晰实现路径时，优先沿用，而不是抽象出新的并行体系。
 - 新增长期有效的环境变量、接口约束、鉴权边界、跨模块规则、测试门槛时，同步更新 `AGENTS.md`。
 - 普通局部修补不补文档；只有会影响后续多次开发决策的规则才写入这里。
+
+## 7. 知识入库长期规则
+
+权威来源补充：
+
+- 知识入库服务与状态流转以 `src/lib/knowledge/*` 为准。
+- 知识文档与 chunk 持久化以 `src/lib/db/knowledge-repository.ts`、`src/lib/db/schema.ts` 为准。
+- 知识入库 API 以 `src/app/api/knowledge/documents/*` 为准。
+- 设置页与知识管理分区以 `src/app/(app)/settings/page.tsx`、`src/components/settings/settings-page.tsx`、`src/components/knowledge/knowledge-workspace.tsx` 为准。
+
+项目事实补充：
+
+- 知识入库是独立受保护链路，不重写 `/api/chat` 主流程，也不改变聊天 SSE 契约。
+- 当前知识入库支持 `text/plain`、`text/markdown`、`application/pdf`。
+- 当前阶段不持久化原始二进制文件；只持久化文档元信息、`extracted_text` 与 `knowledge_chunks`。
+- 默认 chunk 切分与上传大小限制由 `KNOWLEDGE_BASE_CHUNK_SIZE`、`KNOWLEDGE_BASE_CHUNK_OVERLAP`、`KNOWLEDGE_BASE_MAX_FILE_SIZE` 控制。
+- `knowledge_documents.status` 使用 `uploaded / parsed / chunked / failed`。
+- `knowledge_chunks.embedding_status` 当前只作为后续 embedding 阶段预留，默认 `pending`。
+- 所有知识文档与 chunk 查询、详情、删除都必须带 `user_id` 做数据隔离。
+
+关键路径补充：
+
+- 知识入库 API：`src/app/api/knowledge/documents/route.ts`
+- 知识文档详情/删除 API：`src/app/api/knowledge/documents/[documentId]/route.ts`
+- 知识 chunk 列表 API：`src/app/api/knowledge/documents/[documentId]/chunks/route.ts`
+- 设置页：`src/app/(app)/settings/page.tsx`
+- `/knowledge` 兼容旧入口并重定向到 `/settings`
+
+运行语义补充：
+
+- `/api/knowledge/documents`、`/api/knowledge/documents/[documentId]`、`/api/knowledge/documents/[documentId]/chunks` 都是鉴权后的 `nodejs` Route Handlers。
+- 缺少 `DATABASE_URL` 时，知识入库与知识管理接口返回数据库未配置错误，不提供匿名或内存降级。
+- 文档入库流程先写 `knowledge_documents`，再解析文本、切分 chunk，并在事务内完成 chunk 持久化与最终 `chunked` 状态更新。
+- 解析或入库失败时，文档状态必须落为 `failed`，并记录 `error_message`。
+- 删除知识文档时只删除文档主记录，`knowledge_chunks` 通过外键 `ON DELETE CASCADE` 联动删除。
+
+提交前检查补充：
+
+- `knowledge_documents` 与 `knowledge_chunks` 表结构、索引和状态枚举与代码保持一致。
+- 知识 API 仍然保持鉴权保护，且只允许访问当前登录用户自己的文档与 chunks。
+- 文档失败状态仍然会持久化 `error_message`，不会留下“文档成功但 chunks 半写入”的脏状态。
+- 如果知识入库支持的文件类型、文件存储策略、状态流转、事务边界或知识 API 行为发生变化，必须同步更新 `AGENTS.md` 与 `README.md`。
+## 8. Knowledge Retrieval
+
+- Internal knowledge retrieval lives on top of persisted `knowledge_chunks` and must stay scoped to the current authenticated `user_id`.
+- `src/lib/agent/tools.ts` and `src/lib/agent/runtime.ts` are the authority for the retrieval -> rerank -> relevance gating -> answer flow.
+- `searchKnowledgeBase()` should keep reusing the existing `knowledge-base` route, trace events, query rewrite flow, and SSE chat stream instead of introducing a second retrieval protocol.
+- The default retrieval mode for this phase is PostgreSQL text retrieval, controlled by:
+  - `KNOWLEDGE_BASE_MAX_RESULTS`
+  - `KNOWLEDGE_BASE_MIN_SCORE`
+  - `KNOWLEDGE_BASE_ENABLE_RERANK`
+  - `KNOWLEDGE_BASE_SEARCH_MODE`
+  - `KNOWLEDGE_BASE_CHUNK_SIZE`
+  - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
+  - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+  - `JINA_API_KEY`
+  - `JINA_RERANK_MODEL`
+- Assistant source citations may be returned in `/api/chat` through existing assistant message metadata and persisted in `chat_messages.metadata`; do not add a new SSE event type just for citations in this phase.
+- Retrieval failure, missing rerank configuration, or weak hits must degrade gracefully to a no-knowledge answer path; they must not leak other users' chunks or fabricate citations.

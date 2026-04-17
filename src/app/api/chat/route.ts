@@ -235,6 +235,7 @@ export async function POST(request: Request) {
           userMessage: payload.message,
           conversation,
           memorySummary,
+          knowledgeUserId: userId,
           emit,
           signal: request.signal,
         });
@@ -263,6 +264,7 @@ export async function POST(request: Request) {
             metadata: {
               runId: result.runId,
               trace: result.trace,
+              citations: result.citations,
             },
           });
 
@@ -277,6 +279,7 @@ export async function POST(request: Request) {
           const assistantMessage = toMessage("assistant", result.assistantText, {
             runId: result.runId,
             trace: result.trace,
+            citations: result.citations,
           }, {
             id: persistedAssistantMessage.id,
             createdAt: persistedAssistantMessage.createdAt,

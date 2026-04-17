@@ -48,3 +48,53 @@ CREATE INDEX IF NOT EXISTS chat_sessions_user_id_last_message_at_updated_at_idx
 
 CREATE INDEX IF NOT EXISTS chat_messages_session_id_sequence_no_idx
   ON chat_messages (session_id, sequence_no ASC);
+
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  original_filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  file_size BIGINT NOT NULL,
+  extracted_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('uploaded', 'parsed', 'chunked', 'failed')) DEFAULT 'uploaded',
+  error_message TEXT,
+  chunk_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  char_count INTEGER NOT NULL,
+  embedding_status TEXT NOT NULL CHECK (embedding_status IN ('pending', 'ready', 'failed')) DEFAULT 'pending',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_user_id_updated_at_idx
+  ON knowledge_documents (user_id, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_user_id_status_updated_at_idx
+  ON knowledge_documents (user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_document_id_chunk_index_idx
+  ON knowledge_chunks (document_id, chunk_index ASC);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_user_id_document_id_idx
+  ON knowledge_chunks (user_id, document_id);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_user_id_embedding_status_created_at_idx
+  ON knowledge_chunks (user_id, embedding_status, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS knowledge_documents_title_idx
+  ON knowledge_documents (title);
+
+CREATE INDEX IF NOT EXISTS knowledge_chunks_content_fts_idx
+  ON knowledge_chunks
+  USING GIN (to_tsvector('simple', content));

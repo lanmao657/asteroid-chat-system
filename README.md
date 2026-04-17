@@ -44,6 +44,12 @@ npm run dev
 | `FETCH_MAX_PAGES` | 最多抓取页面数 | `3` |
 | `WEB_FETCH_TIMEOUT_MS` | 搜索/抓取超时 | `12000` |
 | `KNOWLEDGE_BASE_MAX_RESULTS` | 知识库候选条数 | `4` |
+| `KNOWLEDGE_BASE_MIN_SCORE` | 知识库最小保留分数 | `0.18` |
+| `KNOWLEDGE_BASE_ENABLE_RERANK` | 是否启用可选 rerank | `true` |
+| `KNOWLEDGE_BASE_SEARCH_MODE` | 知识检索模式 | `fts` |
+| `KNOWLEDGE_BASE_CHUNK_SIZE` | 默认 chunk 字符长度 | `1200` |
+| `KNOWLEDGE_BASE_CHUNK_OVERLAP` | 默认 chunk overlap 字符长度 | `200` |
+| `KNOWLEDGE_BASE_MAX_FILE_SIZE` | 上传文件大小上限，单位 bytes | `5242880` |
 | `JINA_API_KEY` | 可选 Jina Rerank API key | empty |
 | `JINA_RERANK_MODEL` | Jina rerank 模型 | `jina-reranker-v2-base-multilingual` |
 | `WEATHER_API_BASE_URL` | 天气查询服务地址 | `https://wttr.in` |
@@ -192,3 +198,81 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select id, user_id, titl
 psql postgresql://lanmao:550695@localhost:5432/mydb -c "select session_id, sequence_no, role, created_at from chat_messages order by created_at desc limit 10;"
 psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_id, status, finished_at from agent_run_logs order by finished_at desc limit 5;"
 ```
+
+## Knowledge Retrieval
+
+- Internal knowledge retrieval now reads from persisted `knowledge_chunks`, scoped to the current authenticated user.
+- The default retrieval path is PostgreSQL text search with lightweight keyword fallback. No vector database is required for this phase.
+- Assistant answers may include `citations` metadata in `chat_messages.metadata`, and the existing chat UI renders those citations under assistant messages.
+- New retrieval envs:
+  - `KNOWLEDGE_BASE_MAX_RESULTS`
+  - `KNOWLEDGE_BASE_MIN_SCORE`
+  - `KNOWLEDGE_BASE_ENABLE_RERANK`
+  - `KNOWLEDGE_BASE_SEARCH_MODE`
+
+## Knowledge Ingestion
+
+- Knowledge ingestion is a separate protected flow. It does not rewrite `/api/chat`, the SSE contract, or the existing chat workspace data flow.
+- Uploaded source files are parsed on the server and discarded after ingestion. This phase stores document metadata, extracted text, and chunks in PostgreSQL only.
+- Supported upload types are `text/plain`, `text/markdown`, and `application/pdf`.
+- Default chunking and upload limits are controlled by:
+  - `KNOWLEDGE_BASE_CHUNK_SIZE`
+  - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
+  - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+- The protected settings page is available at `/settings`, and it now contains both account actions and the knowledge base management UI. The legacy `/knowledge` route redirects there.
+
+### Knowledge APIs
+
+- `POST /api/knowledge/documents`
+  - Accepts `multipart/form-data` with a single `file` field.
+  - Parses the file, stores the document row, chunks the extracted text, and persists chunks.
+- `GET /api/knowledge/documents?limit=50`
+  - Lists the current user's documents.
+- `GET /api/knowledge/documents/<documentId>`
+  - Returns the current user's document detail, including `extractedText`.
+- `GET /api/knowledge/documents/<documentId>/chunks`
+  - Returns the current user's chunk list for the document.
+- `DELETE /api/knowledge/documents/<documentId>`
+  - Deletes the current user's document and cascades chunk deletion through PostgreSQL foreign keys.
+
+### Knowledge Status Model
+
+- `knowledge_documents.status` progresses through `uploaded`, `parsed`, `chunked`, or `failed`.
+- Parse or ingest failures persist `error_message` on the document row.
+- Final chunk persistence and document finalization run in one PostgreSQL transaction so the document does not end up marked `chunked` without persisted chunks.
+
+### Knowledge Tables
+
+`knowledge_documents`
+
+- `id`: document identifier
+- `user_id`: owning user id from better-auth
+- `title`: derived document title
+- `original_filename`: uploaded filename
+- `mime_type`: normalized supported MIME type
+- `file_size`: uploaded file size in bytes
+- `extracted_text`: parsed plain text used for later retrieval/indexing work
+- `status`: `uploaded`, `parsed`, `chunked`, or `failed`
+- `error_message`: persisted failure reason when ingestion fails
+- `chunk_count`: number of persisted chunks
+- `created_at` / `updated_at`: lifecycle timestamps
+
+`knowledge_chunks`
+
+- `id`: chunk identifier
+- `document_id`: owning document id
+- `user_id`: owning user id for strict data isolation
+- `chunk_index`: stable in-document order
+- `content`: chunk text
+- `char_count`: chunk size in characters
+- `embedding_status`: reserved for the next phase, defaults to `pending`
+- `metadata`: reserved JSONB payload for future retrieval/indexing extensions
+- `created_at`: chunk timestamp
+
+### Knowledge Verification
+
+1. Start PostgreSQL and log in to the app.
+2. Open `http://localhost:3000/settings`.
+3. Upload a `txt`, `md`, or `pdf` file smaller than the configured `KNOWLEDGE_BASE_MAX_FILE_SIZE` limit. The default is 5 MB.
+4. Confirm the document reaches `chunked` (or `failed`) and appears in the settings list with the latest status and timestamp.
+5. Delete the document and confirm it disappears from the list.

@@ -2,15 +2,12 @@
 
 import { useState } from "react";
 
-import { useRouter } from "next/navigation";
-
 import { LogOut } from "lucide-react";
 
-import { authClient } from "@/lib/auth-client";
 import styles from "@/components/chat-workspace.module.css";
+import { authClient } from "@/lib/auth-client";
 
-export function SignOutButton() {
-  const router = useRouter();
+export function SignOutButton({ className }: { className?: string } = {}) {
   const [pending, setPending] = useState(false);
 
   const handleClick = async () => {
@@ -18,8 +15,7 @@ export function SignOutButton() {
 
     try {
       await authClient.signOut();
-      router.replace("/login");
-      router.refresh();
+      window.location.assign("/login");
     } finally {
       setPending(false);
     }
@@ -27,7 +23,7 @@ export function SignOutButton() {
 
   return (
     <button
-      className={styles.sidebarUtility}
+      className={className ?? styles.sidebarUtility}
       disabled={pending}
       onClick={() => {
         void handleClick();
@@ -37,7 +33,7 @@ export function SignOutButton() {
       <span className={styles.sidebarUtilityIcon}>
         <LogOut size={15} />
       </span>
-      <span>{pending ? "正在退出..." : "退出登录"}</span>
+      <span>{pending ? "退出中..." : "退出登录"}</span>
     </button>
   );
 }

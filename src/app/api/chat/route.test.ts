@@ -150,6 +150,7 @@ describe("POST /api/chat", () => {
         taskCategory: "general",
         status: "completed",
         assistantText: "hello world",
+        citations: [],
       };
     });
   });
@@ -209,6 +210,11 @@ describe("POST /api/chat", () => {
     expect(createSessionMock).toHaveBeenCalledWith({
       userId: "user-1",
     });
+    expect(runAgentTurnMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        knowledgeUserId: "user-1",
+      }),
+    );
     expect(events.map((event) => event.type)).toContain("assistant_final");
   });
 
@@ -276,6 +282,117 @@ describe("POST /api/chat", () => {
     expect(assistantFinalEvent?.message.id).toBe("message-assistant-1");
     expect(assistantPersisted).toBe(true);
     expect(insertAgentRunLogMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns persisted assistant citations in assistant_final metadata", async () => {
+    runAgentTurnMock.mockImplementationOnce(async ({ emit, sessionId }) => {
+      emit({ type: "run_started", runId: "run-2", sessionId });
+      emit({ type: "session", sessionId, provider: "Mock Provider" });
+
+      return {
+        sessionId,
+        runId: "run-2",
+        userMessage: "退款处理 到账时效",
+        conversation: [],
+        recentConversation: [],
+        memorySummary: "updated summary",
+        toolResults: [],
+        taskCategory: "policy_qa",
+        status: "completed",
+        assistantText: "请先确认订单状态，再同步到账时效。",
+        citations: [
+          {
+            citationId: "doc-1:chunk-1",
+            sourceType: "knowledge_base",
+            documentId: "doc-1",
+            documentTitle: "退款处理 SOP",
+            chunkId: "chunk-1",
+            chunkIndex: 0,
+            snippet: "先确认订单状态，再同步到账时效。",
+            score: 0.91,
+          },
+        ],
+      };
+    });
+    getSessionByIdMock.mockResolvedValueOnce({
+      id: "session-1",
+      userId: "user-1",
+      title: "新对话",
+      summary: "",
+      createdAt: "2026-04-12T00:00:00.000Z",
+      updatedAt: "2026-04-12T00:00:00.000Z",
+      lastMessageAt: null,
+    });
+    appendMessageMock
+      .mockResolvedValueOnce({
+        id: "message-user-1",
+        sessionId: "session-1",
+        role: "user",
+        content: "退款处理 到账时效",
+        metadata: {},
+        sequenceNo: 1,
+        createdAt: "2026-04-12T00:00:01.000Z",
+      })
+      .mockResolvedValueOnce({
+        id: "message-assistant-2",
+        sessionId: "session-1",
+        role: "assistant",
+        content: "请先确认订单状态，再同步到账时效。",
+        metadata: {
+          runId: "run-2",
+          citations: [
+            {
+              citationId: "doc-1:chunk-1",
+              sourceType: "knowledge_base",
+              documentId: "doc-1",
+              documentTitle: "退款处理 SOP",
+              chunkId: "chunk-1",
+              chunkIndex: 0,
+              snippet: "先确认订单状态，再同步到账时效。",
+              score: 0.91,
+            },
+          ],
+        },
+        sequenceNo: 2,
+        createdAt: "2026-04-12T00:00:02.000Z",
+      });
+    listMessagesBySessionMock.mockResolvedValueOnce([
+      {
+        id: "message-user-1",
+        sessionId: "session-1",
+        role: "user",
+        content: "退款处理 到账时效",
+        metadata: {},
+        sequenceNo: 1,
+        createdAt: "2026-04-12T00:00:01.000Z",
+      },
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: "session-1",
+          message: "退款处理 到账时效",
+        }),
+      }),
+    );
+    const events = await readSseEvents(response);
+    const assistantFinalEvent = events.find(
+      (event): event is Extract<AgentStreamEvent, { type: "assistant_final" }> =>
+        event.type === "assistant_final",
+    );
+
+    expect(assistantFinalEvent?.message.metadata).toEqual(
+      expect.objectContaining({
+        citations: [
+          expect.objectContaining({
+            documentTitle: "退款处理 SOP",
+            chunkId: "chunk-1",
+          }),
+        ],
+      }),
+    );
   });
 
   it("returns 503 when chat persistence is unavailable", async () => {

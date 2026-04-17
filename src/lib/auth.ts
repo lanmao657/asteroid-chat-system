@@ -35,6 +35,9 @@ export const auth = betterAuth({
 
 let authSchemaReadyPromise: Promise<void> | null = null;
 
+const authSchemaInitErrorMessage =
+  "Authentication requires a reachable PostgreSQL database. Check DATABASE_URL and that PostgreSQL is running.";
+
 const ignorableMigrationErrorCodes = new Set(["42P07", "42710", "42701"]);
 
 const getErrorCode = (error: unknown) => {
@@ -66,8 +69,10 @@ const isIgnorableMigrationError = (error: unknown): boolean => {
 
 export const ensureAuthSchema = async () => {
   if (!authSchemaReadyPromise) {
-    authSchemaReadyPromise = getMigrations(auth.options)
-      .then(async ({ runMigrations }) => {
+    authSchemaReadyPromise = Promise.resolve()
+      .then(async () => {
+        const { runMigrations } = await getMigrations(auth.options);
+
         try {
           await runMigrations();
         } catch (error) {
@@ -75,16 +80,16 @@ export const ensureAuthSchema = async () => {
             return;
           }
 
-          console.error("Failed to initialize Better Auth schema.", error);
-          throw new Error("Failed to initialize Better Auth schema.", {
-            cause: error,
-          });
+          throw error;
         }
       })
       .then(() => undefined)
       .catch((error) => {
+        console.error("Failed to initialize Better Auth schema.", error);
         authSchemaReadyPromise = null;
-        throw error;
+        throw new Error(authSchemaInitErrorMessage, {
+          cause: error,
+        });
       });
   }
 
@@ -93,4 +98,4 @@ export const ensureAuthSchema = async () => {
 
 export type AppAuthSession = (typeof auth)["$Infer"]["Session"];
 
-export { isIgnorableMigrationError };
+export { authSchemaInitErrorMessage, isIgnorableMigrationError };

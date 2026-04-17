@@ -9,6 +9,7 @@ import {
   searchWeb,
 } from "@/lib/agent/tools";
 import type {
+  AssistantCitation,
   AgentRunTrace,
   AgentState,
   AgentRunTaskCategory,
@@ -298,6 +299,41 @@ const toTraceDocuments = (documents: RetrievalDocument[]) =>
     score: document.scores.final,
   }));
 
+const buildAssistantCitations = (documents: RetrievalDocument[]): AssistantCitation[] => {
+  const citations: Array<AssistantCitation | null> = documents
+    .filter((document) => document.source === "internal-doc")
+    .map((document) => {
+      const metadata = (document.metadata ?? {}) as Record<string, unknown>;
+      const documentId = typeof metadata.documentId === "string" ? metadata.documentId : "";
+      const chunkId = typeof metadata.chunkId === "string" ? metadata.chunkId : document.id;
+      const chunkIndex =
+        typeof metadata.chunkIndex === "number" ? metadata.chunkIndex : -1;
+      const documentTitle =
+        typeof metadata.documentTitle === "string" ? metadata.documentTitle : document.title;
+      const snippet =
+        typeof metadata.snippet === "string" && metadata.snippet.trim().length > 0
+          ? metadata.snippet
+          : document.content.slice(0, 180);
+
+      if (!documentId || !chunkId || chunkIndex < 0 || !documentTitle) {
+        return null;
+      }
+
+      return {
+        citationId: `${documentId}:${chunkId}`,
+        sourceType: "knowledge_base" as const,
+        documentId,
+        documentTitle,
+        chunkId,
+        chunkIndex,
+        snippet,
+        score: document.scores.rerank ?? document.scores.final,
+      };
+    });
+
+  return citations.filter((citation): citation is AssistantCitation => citation != null);
+};
+
 const isUsableWebResult = (result: SearchResult) => {
   const signals = result.rankingSignals ?? [];
   if (signals.includes("community-pattern")) {
@@ -450,6 +486,7 @@ export const runAgentTurn = async ({
   userMessage,
   conversation,
   memorySummary,
+  knowledgeUserId,
   emit,
   signal,
   dependencies,
@@ -458,6 +495,7 @@ export const runAgentTurn = async ({
   userMessage: string;
   conversation: ChatMessage[];
   memorySummary: string;
+  knowledgeUserId?: string;
   emit: (event: AgentStreamEvent) => void;
   signal?: AbortSignal;
   dependencies?: Partial<RuntimeDependencies>;
@@ -483,6 +521,7 @@ export const runAgentTurn = async ({
   const searchResults: SearchResult[] = [];
   const pageContents: FetchedPage[] = [];
   const retrievalDocuments: RetrievalDocument[] = [];
+  let citations: AssistantCitation[] = [];
   let assistantText = "";
   let routed: RouteTarget = "none";
   let runTrace: AgentRunTrace | undefined;
@@ -498,6 +537,7 @@ export const runAgentTurn = async ({
     taskCategory,
     status: "aborted",
     assistantText,
+    citations,
     trace: runTrace,
   });
 
@@ -761,6 +801,7 @@ export const runAgentTurn = async ({
       let rewriteResult: QueryRewriteResult | undefined;
 
       const kbResponse = await knowledgeBaseSearch({
+        userId: knowledgeUserId ?? "",
         query: userMessage,
         signal,
         onProgress: (progress) => {
@@ -769,22 +810,12 @@ export const runAgentTurn = async ({
             progress: { ...progress, callId: kbCall.id },
           });
 
-          if (progress.message === "Running hybrid retrieval (sparse + dense)") {
+          if (progress.message === "Running knowledge retrieval") {
             emitRagStep(
               makeStep(
                 "searching",
                 "Searching",
-                "Running hybrid retrieval across the internal knowledge base.",
-              ),
-            );
-          }
-
-          if (progress.message === "Hybrid retrieval degraded to dense-only retrieval") {
-            emitRagStep(
-              makeStep(
-                "searching",
-                "Searching",
-                "Hybrid retrieval is unavailable, falling back to dense-only retrieval.",
+                "Running internal knowledge retrieval across the current user's chunks.",
               ),
             );
           }
@@ -799,12 +830,15 @@ export const runAgentTurn = async ({
             );
           }
 
-          if (progress.message === "Jina rerank failed, keeping the local hybrid ranking") {
+          if (progress.message === "Skipping rerank") {
             emitRagStep(
               makeStep(
                 "reranking",
                 "Reranking",
-                "Reranking was unavailable, so the local ranking was kept.",
+                "Reranking was skipped, so the original retrieval ranking was kept.",
+                {
+                  reason: progress.detail,
+                },
               ),
             );
           }
@@ -812,6 +846,8 @@ export const runAgentTurn = async ({
       });
 
       retrievalDocuments.push(...kbResponse.documents);
+      const kbRawCandidateCount = kbResponse.rawResults?.length ?? kbResponse.documents.length;
+      const kbFilteredOutCount = kbResponse.filteredOutCount ?? 0;
       knowledgeTrace.push(
         makeStep(
           "searching",
@@ -819,6 +855,8 @@ export const runAgentTurn = async ({
           `Knowledge-base ${kbResponse.strategy} search completed with ${kbResponse.documents.length} candidate(s).`,
           {
             strategy: kbResponse.strategy,
+            rawCandidateCount: kbRawCandidateCount,
+            filteredOutCount: kbFilteredOutCount,
           },
         ),
       );
@@ -830,6 +868,8 @@ export const runAgentTurn = async ({
           {
             strategy: kbResponse.strategy,
             candidates: kbResponse.documents.length,
+            rawCandidateCount: kbRawCandidateCount,
+            filteredOutCount: kbFilteredOutCount,
           },
         ),
       );
@@ -837,7 +877,9 @@ export const runAgentTurn = async ({
       knowledgeTrace.push(
         kbResponse.reranked
           ? makeStep("reranking", "Reranking", "Jina API reranking completed.")
-          : makeStep("reranking", "Reranking", "Jina reranking unavailable, using local ranking instead."),
+          : makeStep("reranking", "Reranking", "Jina reranking unavailable, using local ranking instead.", {
+              reason: kbResponse.rerankSkippedReason,
+            }),
       );
 
       const gradeCall = createToolCall("knowledgeBaseSearch", "grade", {
@@ -938,10 +980,14 @@ export const runAgentTurn = async ({
         );
 
         const rewrittenResponse = await knowledgeBaseSearch({
+          userId: knowledgeUserId ?? "",
           query: rewrittenQuery,
           signal,
         });
         rewrittenDocs = rewrittenResponse.documents;
+        const rewrittenRawCandidateCount =
+          rewrittenResponse.rawResults?.length ?? rewrittenDocs.length;
+        const rewrittenFilteredOutCount = rewrittenResponse.filteredOutCount ?? 0;
         retrievalDocuments.splice(0, retrievalDocuments.length, ...rewrittenDocs);
         rewriteTrace.push(
           makeStep(
@@ -951,6 +997,8 @@ export const runAgentTurn = async ({
             {
               strategy: rewrittenResponse.strategy,
               candidates: rewrittenDocs.length,
+              rawCandidateCount: rewrittenRawCandidateCount,
+              filteredOutCount: rewrittenFilteredOutCount,
             },
           ),
         );
@@ -962,6 +1010,8 @@ export const runAgentTurn = async ({
             {
               strategy: rewrittenResponse.strategy,
               candidates: rewrittenDocs.length,
+              rawCandidateCount: rewrittenRawCandidateCount,
+              filteredOutCount: rewrittenFilteredOutCount,
             },
           ),
         );
@@ -1003,6 +1053,12 @@ export const runAgentTurn = async ({
           topGap: grade.topGap,
           reason: grade.reason,
           queryUsed: rewrittenQuery,
+          searchMode: kbResponse.strategy,
+          rawCandidateCount: kbRawCandidateCount,
+          keptCount: rewrittenDocs.length,
+          filteredOutCount: kbFilteredOutCount,
+          reranked: kbResponse.reranked,
+          rerankSkippedReason: kbResponse.rerankSkippedReason,
         }),
         trace: [
           ...rewriteTrace,
@@ -1102,6 +1158,7 @@ export const runAgentTurn = async ({
     if (false && routed === "web") {
       // Legacy web rewrite path intentionally disabled.
     }
+    citations = buildAssistantCitations(retrievalDocuments);
     const answerResult = await streamAssistantWithContinuations({
       provider,
       userMessage,
@@ -1130,6 +1187,7 @@ export const runAgentTurn = async ({
       taskCategory,
       status: "completed",
       assistantText,
+      citations,
       trace: runTrace,
     };
   } catch (error) {
@@ -1182,6 +1240,7 @@ export const runAgentTurn = async ({
       toolResults.push(failedResult);
       emit({ type: "tool_result", toolResult: failedResult });
 
+      citations = buildAssistantCitations(retrievalDocuments);
       const answerResult = await streamAssistantWithContinuations({
         provider,
         userMessage,
@@ -1210,6 +1269,7 @@ export const runAgentTurn = async ({
         taskCategory,
         status: "completed",
         assistantText,
+        citations,
         trace: runTrace,
       };
     }

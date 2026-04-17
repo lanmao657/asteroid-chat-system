@@ -4,11 +4,13 @@ import { ChatMessageContent } from "@/components/chat-message-content";
 import { getThinkingPhase, ThinkingBlock } from "@/components/chat/thinking-block";
 import styles from "@/components/chat-workspace.module.css";
 import {
+  getMessageCitations,
   getMessageThoughts,
   getMessageTrace,
   type MessageListItem,
   type StreamingDraft,
 } from "@/components/chat/types";
+import type { AssistantCitation } from "@/lib/agent/types";
 
 interface MessageListProps {
   emptyState: ReactNode;
@@ -22,6 +24,52 @@ const ROLE_LABELS = {
   assistant: "北境助手",
   user: "你",
 } as const;
+
+const INLINE_CITATION_LIMIT = 3;
+
+function CitationList({ citations }: { citations: AssistantCitation[] }) {
+  if (citations.length === 0) {
+    return null;
+  }
+
+  const visible = citations.slice(0, INLINE_CITATION_LIMIT);
+  const hidden = citations.slice(INLINE_CITATION_LIMIT);
+
+  return (
+    <div className={styles.citationBlock}>
+      <div className={styles.citationTitle}>来源引用</div>
+      <div className={styles.citationList}>
+        {visible.map((citation) => (
+          <div className={styles.citationCard} key={citation.citationId}>
+            <div className={styles.citationCardHeader}>
+              <span className={styles.citationDocumentTitle}>{citation.documentTitle}</span>
+              <span className={styles.citationMeta}>片段 #{citation.chunkIndex + 1}</span>
+            </div>
+            <div className={styles.citationSnippet}>{citation.snippet}</div>
+          </div>
+        ))}
+      </div>
+      {hidden.length > 0 ? (
+        <details className={styles.citationMore}>
+          <summary className={styles.citationMoreSummary}>
+            查看更多来源 ({hidden.length})
+          </summary>
+          <div className={styles.citationList}>
+            {hidden.map((citation) => (
+              <div className={styles.citationCard} key={citation.citationId}>
+                <div className={styles.citationCardHeader}>
+                  <span className={styles.citationDocumentTitle}>{citation.documentTitle}</span>
+                  <span className={styles.citationMeta}>片段 #{citation.chunkIndex + 1}</span>
+                </div>
+                <div className={styles.citationSnippet}>{citation.snippet}</div>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
 
 export function MessageList({
   emptyState,
@@ -41,6 +89,8 @@ export function MessageList({
           {messages.map((message) => {
             const hasAssistantContent =
               message.role === "assistant" && message.content.trim().length > 0;
+            const citations =
+              message.role === "assistant" ? getMessageCitations(message) : [];
 
             return (
               <article className={styles.message} data-role={message.role} key={message.id}>
@@ -61,6 +111,7 @@ export function MessageList({
                       trace={getMessageTrace(message)}
                     />
                     <ChatMessageContent content={message.content} role={message.role} />
+                    <CitationList citations={citations} />
                   </div>
                 ) : (
                   <ChatMessageContent content={message.content} role={message.role} />

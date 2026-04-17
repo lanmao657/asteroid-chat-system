@@ -9,7 +9,6 @@ import {
   type KeyboardEventHandler,
 } from "react";
 
-import { SignOutButton } from "@/components/auth/sign-out-button";
 import { AppSidebar } from "@/components/chat/app-sidebar";
 import { ChatHeader } from "@/components/chat/chat-header";
 import { ChatInputPanel } from "@/components/chat/chat-input-panel";
@@ -46,13 +45,6 @@ import type { AgentRunTrace, AgentStreamEvent, ChatMessage, RetrievalStep } from
 interface ActiveRunState {
   sessionId: string;
   runId: string;
-}
-
-interface ChatWorkspaceProps {
-  currentUser: {
-    email: string;
-    name: string;
-  };
 }
 
 interface ChatSessionsResponse {
@@ -259,7 +251,7 @@ const isKnowledgeBaseToolEvent = (
   );
 };
 
-export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
+export function ChatWorkspace() {
   const [bootSession] = useState<SessionSummary>(() => createSession());
   const [sessions, setSessions] = useState<SessionSummary[]>(() => [bootSession]);
   const [activeSessionId, setActiveSessionId] = useState<string>(() => bootSession.id);
@@ -1072,9 +1064,6 @@ export function ChatWorkspace({ currentUser }: ChatWorkspaceProps) {
       <aside className={styles.sidebar} data-open={isSidebarOpen}>
         <AppSidebar
           activeSessionId={activeSessionId}
-          accountAction={<SignOutButton />}
-          accountEmail={currentUser.email}
-          accountName={currentUser.name}
           formatTime={formatTime}
           isCollapsed={!isSidebarOpen}
           isStreaming={isStreaming}

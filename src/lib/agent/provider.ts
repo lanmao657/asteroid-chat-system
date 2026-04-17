@@ -516,7 +516,14 @@ class OpenAICompatibleProvider implements LLMProvider {
         url: document.url,
         content: clip(document.content, 420),
         scores: document.scores,
-        metadata: document.metadata,
+        metadata: {
+          documentId: document.metadata?.documentId,
+          documentTitle: document.metadata?.documentTitle ?? document.title,
+          chunkId: document.metadata?.chunkId,
+          chunkIndex: document.metadata?.chunkIndex,
+          snippet: document.metadata?.snippet,
+          sourceType: document.metadata?.sourceType,
+        },
       }));
     const externalDocuments = input.retrievalDocuments
       .filter((document) => !document.url?.startsWith("kb://") && document.source !== "internal-doc")

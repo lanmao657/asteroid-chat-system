@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("server-only", () => ({}));
+
 import { runAgentTurn } from "./runtime";
 import { SearchToolError } from "./tools";
 import type { AgentStreamEvent, LLMProvider } from "./types";
@@ -105,7 +107,12 @@ describe("runAgentTurn", () => {
             url: "kb://enterprise/docs/agent-workspace-design",
             content: "agent workspace design docs and implementation guidance",
             metadata: {
-              tags: ["agent", "workspace", "design", "docs"],
+              documentId: "doc-1",
+              chunkId: "chunk-1",
+              chunkIndex: 0,
+              documentTitle: "Agent workspace design playbook",
+              snippet: "agent workspace design docs",
+              sourceType: "knowledge_base",
             },
             scores: { final: 0.72 },
           },
@@ -122,7 +129,7 @@ describe("runAgentTurn", () => {
       emit,
       dependencies: {
         provider,
-        searchKnowledgeBase,
+        searchKnowledgeBase: searchKnowledgeBase as never,
       },
     });
 
@@ -133,6 +140,12 @@ describe("runAgentTurn", () => {
     expect(events.map((event) => event.type)).toContain("tool_progress");
     expect(events.map((event) => event.type)).toContain("tool_result");
     expect(events.map((event) => event.type)).toContain("rag_step");
+    expect(result.citations).toEqual([
+      expect.objectContaining({
+        documentId: "doc-1",
+        chunkId: "chunk-1",
+      }),
+    ]);
     const toolResultEvent = events.find(
       (event) =>
         event.type === "tool_result" &&
@@ -197,7 +210,7 @@ describe("runAgentTurn", () => {
       emit,
       dependencies: {
         provider,
-        searchKnowledgeBase,
+        searchKnowledgeBase: searchKnowledgeBase as never,
       },
     });
 
@@ -264,7 +277,7 @@ describe("runAgentTurn", () => {
       emit,
       dependencies: {
         provider,
-        searchKnowledgeBase,
+        searchKnowledgeBase: searchKnowledgeBase as never,
       },
     });
 
@@ -349,7 +362,7 @@ describe("runAgentTurn", () => {
       emit,
       dependencies: {
         provider,
-        searchKnowledgeBase,
+        searchKnowledgeBase: searchKnowledgeBase as never,
         search,
         fetchPage,
       },
@@ -357,7 +370,7 @@ describe("runAgentTurn", () => {
 
     expect(result.status).toBe("completed");
     expect(result.taskCategory).toBe("policy_qa");
-    expect(searchKnowledgeBase).toHaveBeenCalledTimes(1);
+    expect(searchKnowledgeBase).toHaveBeenCalledTimes(2);
     expect(search).toHaveBeenCalledTimes(1);
     expect(fetchPage).toHaveBeenCalledTimes(1);
     expect(

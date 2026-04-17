@@ -12,6 +12,33 @@ const asList = (value: string | undefined, fallback: string[]) => {
   return normalized && normalized.length > 0 ? normalized : fallback;
 };
 
+const asBoolean = (value: string | undefined, fallback: boolean) => {
+  if (value == null) {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
+};
+
+const asEnum = <TValue extends string>(
+  value: string | undefined,
+  allowed: readonly TValue[],
+  fallback: TValue,
+) => {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && allowed.includes(normalized as TValue)
+    ? (normalized as TValue)
+    : fallback;
+};
+
 export const agentEnv = {
   modelProvider: process.env.MODEL_PROVIDER?.trim() || "openai",
   openAiCompatBaseUrl:
@@ -48,6 +75,19 @@ export const agentEnv = {
     "tieba.baidu.com",
   ]),
   knowledgeBaseMaxResults: asNumber(process.env.KNOWLEDGE_BASE_MAX_RESULTS, 4),
+  knowledgeBaseMinScore: asNumber(process.env.KNOWLEDGE_BASE_MIN_SCORE, 0.18),
+  knowledgeBaseEnableRerank: asBoolean(process.env.KNOWLEDGE_BASE_ENABLE_RERANK, true),
+  knowledgeBaseSearchMode: asEnum(
+    process.env.KNOWLEDGE_BASE_SEARCH_MODE,
+    ["fts", "keyword", "hybrid", "vector"] as const,
+    "fts",
+  ),
+  knowledgeBaseChunkSize: asNumber(process.env.KNOWLEDGE_BASE_CHUNK_SIZE, 1_200),
+  knowledgeBaseChunkOverlap: asNumber(process.env.KNOWLEDGE_BASE_CHUNK_OVERLAP, 200),
+  knowledgeBaseMaxFileSize: asNumber(
+    process.env.KNOWLEDGE_BASE_MAX_FILE_SIZE,
+    5 * 1024 * 1024,
+  ),
   jinaApiKey: process.env.JINA_API_KEY?.trim() || "",
   jinaRerankModel: process.env.JINA_RERANK_MODEL?.trim() || "jina-reranker-v2-base-multilingual",
   weatherApiBaseUrl:
