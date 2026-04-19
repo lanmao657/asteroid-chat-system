@@ -64,30 +64,30 @@ const MAX_THOUGHT_STEPS = 20;
 const PROMPT_SUGGESTIONS: PromptSuggestion[] = [
   {
     id: "expense-policy",
-    title: "查询报销制度",
+    title: "报销制度",
     prompt:
       "新员工出差回来后报销流程怎么走？请按结论、适用范围、操作步骤、注意事项和来源说明回答。",
-    description: "验证制度问答和内部知识引用是否清晰。",
+    description: "",
   },
   {
     id: "onboarding-checklist",
-    title: "整理入职清单",
+    title: "入职清单",
     prompt: "请根据新员工培训手册整理一份前 30 天入职学习清单，按周拆分重点任务。",
-    description: "适合验证培训资料整理与行动项输出。",
+    description: "",
   },
   {
     id: "refund-sop",
-    title: "根据客服 SOP 回答",
+    title: "客服 SOP",
     prompt:
       "客户因为退款到账慢而投诉时，客服应该怎么回复？请结合客服退款争议处理 SOP 给出标准说法。",
-    description: "检查 SOP 检索、步骤化回答和话术建议。",
+    description: "",
   },
   {
     id: "sales-brief",
-    title: "总结销售培训资料",
+    title: "销售摘要",
     prompt:
       "请总结新版产品卖点与销售话术指引，给业务同学一份简短的销售培训摘要。",
-    description: "适合验证 FAQ、培训资料和知识复用。",
+    description: "",
   },
 ];
 
@@ -262,7 +262,7 @@ export function ChatWorkspace() {
     Record<string, StreamingDraft | undefined>
   >(() => ({ [bootSession.id]: undefined }));
   const [draft, setDraft] = useState(INITIAL_PROMPT);
-  const [status, setStatus] = useState("企业知识助手已就绪");
+  const [status, setStatus] = useState("加载中…");
   const [providerLabel, setProviderLabel] = useState("OpenAI Compatible");
   const [activeRun, setActiveRun] = useState<ActiveRunState | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -447,7 +447,7 @@ export function ChatWorkspace() {
         if (!response.ok) {
           const errorMessage = await getErrorMessageFromResponse(
             response,
-            "历史会话加载失败。",
+            "失败",
           );
           if (!cancelled) {
             setStatus(errorMessage);
@@ -483,10 +483,10 @@ export function ChatWorkspace() {
           }
         }
 
-        setStatus("企业知识助手已就绪");
+        setStatus("就绪");
       } catch {
         if (!cancelled) {
-          setStatus("历史会话加载失败。");
+          setStatus("失败");
         }
       }
     };
@@ -526,7 +526,7 @@ export function ChatWorkspace() {
         if (!response.ok) {
           const errorMessage = await getErrorMessageFromResponse(
             response,
-            "历史消息加载失败。",
+            "失败",
           );
           if (!cancelled) {
             setStatus(errorMessage);
@@ -557,10 +557,10 @@ export function ChatWorkspace() {
           ),
         );
         markSessionAsLoaded(activeSessionId);
-        setStatus("历史消息已加载");
+        setStatus("就绪");
       } catch {
         if (!cancelled) {
-          setStatus("历史消息加载失败。");
+          setStatus("失败");
         }
       } finally {
         loadingSessionIdsRef.current.delete(activeSessionId);
@@ -716,19 +716,19 @@ export function ChatWorkspace() {
         sessionId,
         createActivity(
           "run",
-          "开始思考",
-          "正在准备本轮上下文与执行路线。",
+          "开始",
+          "正在准备",
           `运行 ID: ${event.runId}`,
         ),
       );
-      setStatus("正在准备上下文...");
+      setStatus("加载中…");
       return;
     }
 
     if (event.type === "session") {
       const normalizedLabel = normalizeProviderLabel(event.provider);
       setProviderLabel(normalizedLabel);
-      setStatus(`已连接到 ${normalizedLabel}`);
+      setStatus("就绪");
       return;
     }
 
@@ -755,7 +755,7 @@ export function ChatWorkspace() {
         createActivity(
           "tool-started",
           formatToolStartedTitle(event.toolCall),
-          "已开始执行这一步。",
+          "已开始",
           safeJson(event.toolCall.input),
         ),
       );
@@ -773,10 +773,10 @@ export function ChatWorkspace() {
         createActivity(
           "tool-progress",
           progressMessage,
-          localizeTraceText(event.progress.detail ?? "正在处理中。"),
+          localizeTraceText(event.progress.detail ?? "处理中。"),
         ),
       );
-      setStatus(progressMessage);
+      setStatus("加载中…");
       return;
     }
 
@@ -795,13 +795,13 @@ export function ChatWorkspace() {
           formatToolResultDetail(event.toolResult),
         ),
       );
-      setStatus(resultSummary);
+      setStatus("加载中…");
       return;
     }
 
     if (event.type === "rag_step") {
       appendThought(sessionId, createRagStepActivity(event.step));
-      setStatus(event.step.label);
+      setStatus("加载中…");
       return;
     }
 
@@ -813,9 +813,9 @@ export function ChatWorkspace() {
     if (event.type === "assistant_started") {
       appendThought(
         sessionId,
-        createActivity("run", "组织回答", "正在整理检索结果并生成最终回复。"),
+        createActivity("run", "生成", "正在生成"),
       );
-      setStatus("正在生成回答...");
+      setStatus("生成中…");
       return;
     }
 
@@ -851,14 +851,14 @@ export function ChatWorkspace() {
               | undefined),
         }),
       );
-      setStatus("回答完成");
+      setStatus("完成");
       return;
     }
 
     if (event.type === "assistant_aborted") {
       appendThought(
         sessionId,
-        createActivity("run", "已停止生成", localizeTraceText(event.message)),
+        createActivity("run", "已停止", localizeTraceText(event.message)),
         "stopped",
       );
       setStatus("已停止");
@@ -871,7 +871,7 @@ export function ChatWorkspace() {
       const formatted = formatErrorMessage(event.message);
       const currentDraft = streamingDraftBySessionRef.current[sessionId];
 
-      setStatus(formatted);
+      setStatus("失败");
       clearStreamingDraft(sessionId);
       appendMessage(
         sessionId,
@@ -907,7 +907,7 @@ export function ChatWorkspace() {
     markSessionAsLoaded(sessionId);
     clearStreamingDraft(sessionId);
     setProviderLabel("OpenAI Compatible");
-    setStatus("正在提交请求...");
+    setStatus("加载中…");
     setShouldAutoFollow(true);
 
     const userMessage = createLocalMessage("user", content);
@@ -937,7 +937,7 @@ export function ChatWorkspace() {
       if (!response.ok || !response.body) {
         markSessionAsNeedingReload(sessionId);
         setStatus(
-          await getErrorMessageFromResponse(response, "无法连接到 /api/chat"),
+          await getErrorMessageFromResponse(response, "失败"),
         );
         setActiveRun(null);
         activeControllerRef.current = null;
@@ -983,7 +983,7 @@ export function ChatWorkspace() {
         return;
       }
 
-      const message = "请求没有顺利完成，请稍后重试。";
+      const message = "请求没有完成，请稍后重试。";
       const currentDraft = streamingDraftBySessionRef.current[sessionId];
 
       setStatus(message);
@@ -1026,7 +1026,7 @@ export function ChatWorkspace() {
         streamingDraftBySessionRef.current = next;
         return next;
       });
-      setStatus("已新建一条知识会话。");
+      setStatus("就绪");
       setComposerDraft("");
       setProviderLabel("OpenAI Compatible");
       setShouldAutoFollow(true);

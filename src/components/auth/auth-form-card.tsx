@@ -15,22 +15,16 @@ type AuthMode = "login" | "register";
 
 const copyByMode = {
   login: {
-    eyebrow: "登录",
-    title: "欢迎回来",
-    description: "继续使用你的工作空间。",
-    submitLabel: "继续登录",
-    secondaryText: "还没有账号？",
+    title: "登录",
+    submitLabel: "登录",
     secondaryHref: "/register",
-    secondaryLabel: "创建账号",
+    secondaryLabel: "去注册",
   },
   register: {
-    eyebrow: "注册",
-    title: "创建账号",
-    description: "只需要几项信息，就能开始使用。",
-    submitLabel: "创建并进入",
-    secondaryText: "已经有账号？",
+    title: "注册",
+    submitLabel: "注册",
     secondaryHref: "/login",
-    secondaryLabel: "返回登录",
+    secondaryLabel: "去登录",
   },
 } as const;
 
@@ -127,9 +121,7 @@ export function AuthFormCard({
   return (
     <div className={styles.card}>
       <div className={styles.header}>
-        <div className={styles.eyebrow}>{copy.eyebrow}</div>
         <h1 className={styles.title}>{copy.title}</h1>
-        <p className={styles.description}>{copy.description}</p>
       </div>
 
       <form
@@ -148,7 +140,6 @@ export function AuthFormCard({
               className={styles.input}
               id="name"
               name="name"
-              placeholder="输入你的姓名"
               required
               type="text"
             />
@@ -188,7 +179,6 @@ export function AuthFormCard({
             onFocus={() => {
               syncPasswordFocus(true);
             }}
-            placeholder="输入你的密码"
             required
             type="password"
           />
@@ -210,7 +200,6 @@ export function AuthFormCard({
               onFocus={() => {
                 syncPasswordFocus(true);
               }}
-              placeholder="再次输入密码"
               required
               type="password"
             />
@@ -232,10 +221,8 @@ export function AuthFormCard({
       </form>
 
       <p className={styles.footer}>
-        {copy.secondaryText} <Link href={copy.secondaryHref}>{copy.secondaryLabel}</Link>
+        <Link href={copy.secondaryHref}>{copy.secondaryLabel}</Link>
       </p>
-
-      <p className={styles.finePrint}>当前支持邮箱密码登录，暂不提供邮箱验证与找回密码。</p>
     </div>
   );
 }

@@ -19,23 +19,23 @@ describe("AuthFormCard", () => {
     vi.clearAllMocks();
   });
 
-  it("renders the login card with key fields", () => {
+  it("renders the login card with concise copy", () => {
     const html = renderToStaticMarkup(<AuthFormCard mode="login" />);
 
-    expect(html).toContain("欢迎回来");
-    expect(html).toContain("继续使用你的工作空间");
-    expect(html).toContain("name=\"email\"");
-    expect(html).toContain("name=\"password\"");
-    expect(html).toContain("创建账号");
+    expect(html).toContain(`>\u767b\u5f55<`);
+    expect(html).toContain('name="email"');
+    expect(html).toContain('name="password"');
+    expect(html).toContain("\u53bb\u6ce8\u518c");
+    expect(html).not.toContain("\u7ee7\u7eed\u4f7f\u7528\u4f60\u7684\u5de5\u4f5c\u7a7a\u95f4");
   });
 
   it("renders the register card with name and confirm password fields", () => {
     const html = renderToStaticMarkup(<AuthFormCard mode="register" />);
 
-    expect(html).toContain("创建账号");
-    expect(html).toContain("只需要几项信息，就能开始使用");
-    expect(html).toContain("name=\"name\"");
-    expect(html).toContain("name=\"confirmPassword\"");
-    expect(html).toContain("返回登录");
+    expect(html).toContain(`>\u6ce8\u518c<`);
+    expect(html).toContain('name="name"');
+    expect(html).toContain('name="confirmPassword"');
+    expect(html).toContain("\u53bb\u767b\u5f55");
+    expect(html).not.toContain("\u53ea\u9700\u8981\u51e0\u9879\u4fe1\u606f\uff0c\u5c31\u80fd\u5f00\u59cb\u4f7f\u7528");
   });
 });

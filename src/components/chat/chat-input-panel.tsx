@@ -26,12 +26,11 @@ export function ChatInputPanel({
   return (
     <section className={styles.composerDock}>
       <div className={styles.composerSurface}>
-        <div className={styles.composerPrompt}>向北辰知识助手提问</div>
         <textarea
           className={styles.textarea}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="输入你的问题，例如：报销流程怎么走、根据客服 SOP 回答退款争议，或整理入职培训清单。"
+          placeholder="例如：报销流程"
           ref={textareaRef}
           rows={1}
           value={draft}
@@ -39,7 +38,7 @@ export function ChatInputPanel({
 
         <div className={styles.composerFooter}>
           <div className={styles.composerHint}>
-            {isStreaming ? "正在流式生成中，点击右侧可随时停止。" : "按 Cmd/Ctrl + Enter 发送"}
+            {isStreaming ? "生成中…" : "Cmd/Ctrl + Enter 发送"}
           </div>
 
           <button
@@ -49,7 +48,7 @@ export function ChatInputPanel({
             type="button"
           >
             {isStreaming ? <Square size={15} /> : <ArrowUp size={15} />}
-            <span>{isStreaming ? "停止生成" : "发送"}</span>
+            <span>{isStreaming ? "停止" : "发送"}</span>
           </button>
         </div>
       </div>

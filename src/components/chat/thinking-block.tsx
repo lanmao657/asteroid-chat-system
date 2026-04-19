@@ -20,10 +20,10 @@ interface ThinkingBlockProps {
 type ThinkingPhase = "thinking" | "responding" | "stopped" | "complete";
 
 const ROUTE_LABELS: Record<NonNullable<AgentRunTrace["route"]>, string> = {
-  web: "联网检索",
-  "knowledge-base": "知识库检索",
-  weather: "天气查询",
-  none: "直接回答",
+  web: "联网",
+  "knowledge-base": "知识库",
+  weather: "天气",
+  none: "直答",
 };
 
 export const getThinkingPhase = ({
@@ -61,25 +61,21 @@ export const getThinkingSummaryText = ({
 }) => {
   if (phase === "thinking") {
     return latestThoughtTitle
-      ? `正在思考 · ${thoughtCount} 步 · ${latestThoughtTitle}`
-      : "正在思考 · 等待第一条步骤";
+      ? `思考中 · ${latestThoughtTitle}`
+      : `思考中 · ${thoughtCount} 步`;
   }
 
   if (phase === "responding") {
     return latestThoughtTitle
-      ? `已切入回答 · 保留 ${thoughtCount} 步记录 · ${latestThoughtTitle}`
-      : "已切入回答 · 保留思考记录";
+      ? `生成中 · ${latestThoughtTitle}`
+      : `生成中 · ${thoughtCount} 步`;
   }
 
   if (phase === "stopped") {
-    return latestThoughtTitle
-      ? `已停止生成 · 共 ${thoughtCount} 步 · ${latestThoughtTitle}`
-      : "已停止生成 · 未输出正文";
+    return latestThoughtTitle ? `已停止 · ${latestThoughtTitle}` : "已停止";
   }
 
-  return latestThoughtTitle
-    ? `思考完成 · ${thoughtCount} 步 · ${latestThoughtTitle}`
-    : "本条回答没有可展示的思考过程";
+  return latestThoughtTitle ? `已完成 · ${latestThoughtTitle}` : "已完成";
 };
 
 export const getThinkingStatusLabel = (phase: ThinkingPhase) => {
@@ -87,12 +83,12 @@ export const getThinkingStatusLabel = (phase: ThinkingPhase) => {
     return "思考中";
   }
   if (phase === "responding") {
-    return "回答中";
+    return "生成中";
   }
   if (phase === "stopped") {
     return "已停止";
   }
-  return "已完成";
+  return "完成";
 };
 
 const getTraceMetaText = (trace?: AgentRunTrace) => {
@@ -101,12 +97,7 @@ const getTraceMetaText = (trace?: AgentRunTrace) => {
   }
 
   const route = ROUTE_LABELS[trace.route];
-  const docCount = trace.retrievedDocuments.length;
-  if (trace.rewrite?.query && trace.finalQuery !== trace.originalQuery) {
-    return `${route} · 改写后命中 ${docCount} 个结果`;
-  }
-
-  return `${route} · 命中 ${docCount} 个结果`;
+  return `${route} · ${trace.retrievedDocuments.length} 条`;
 };
 
 export function ThinkingBlock({
@@ -159,7 +150,7 @@ export function ThinkingBlock({
         </span>
         <span className={styles.thinkingToggleBody}>
           <span className={styles.thinkingToggleHeaderRow}>
-            <span className={styles.thinkingToggleTitle}>思考过程</span>
+            <span className={styles.thinkingToggleTitle}>过程</span>
             <span className={styles.thinkingStatusPill} data-phase={phase}>
               <span className={styles.thinkingStatusDot} data-phase={phase} />
               {getThinkingStatusLabel(phase)}

@@ -90,6 +90,33 @@ input {
   font: inherit;
 }
 
+.settings-ui {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC",
+    sans-serif;
+}
+
+.settings-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(17, 24, 39, 0.18) transparent;
+}
+
+.settings-scrollbar::-webkit-scrollbar {
+  width: 10px;
+}
+
+.settings-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-scrollbar::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.16);
+  background-clip: padding-box;
+}
+
 code,
 pre {
   font-family: var(--font-mono), monospace;

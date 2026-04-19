@@ -8,21 +8,24 @@ import {
 import { SettingsSidebar } from "@/components/settings/settings-sidebar";
 
 describe("SettingsSidebar", () => {
-  it("renders chinese navigation and keeps the active item highlighted", () => {
+  it("renders only two settings categories with the close button and accessible navigation", () => {
     const html = renderToStaticMarkup(
       <SettingsSidebar
         activeCategory={"files" satisfies SettingsCategoryKey}
         categories={SETTINGS_CATEGORIES}
         onSelect={() => {}}
+        onRequestClose={() => {}}
+        presentation="modal"
       />,
     );
 
+    expect(SETTINGS_CATEGORIES).toHaveLength(2);
     expect(html).toContain("设置导航");
     expect(html).toContain("文档管理");
     expect(html).toContain("账号信息");
-    expect(html).not.toContain("Account");
-    expect(html).not.toContain("Files");
     expect(html).toContain('aria-current="page"');
-    expect(html).toContain('role="tablist"');
+    expect(html).toContain('aria-label="关闭设置"');
+    expect(html).not.toContain("Settings");
+    expect(html).not.toContain("鏂囨。");
   });
 });

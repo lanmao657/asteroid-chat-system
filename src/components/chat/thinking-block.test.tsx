@@ -46,8 +46,8 @@ describe("ThinkingBlock", () => {
         phase: "responding",
         thoughtCount: 2,
       }),
-    ).toContain("已切入回答");
-    expect(getThinkingStatusLabel("responding")).toBe("回答中");
+    ).toContain("\u751f\u6210\u4e2d");
+    expect(getThinkingStatusLabel("responding")).toBe("\u751f\u6210\u4e2d");
   });
 
   it("renders an expanded thinking list before content starts streaming", () => {
@@ -61,8 +61,8 @@ describe("ThinkingBlock", () => {
       />,
     );
 
-    expect(html).toContain("思考过程");
-    expect(html).toContain("思考中");
+    expect(html).toContain("\u8fc7\u7a0b");
+    expect(html).toContain("\u601d\u8003\u4e2d");
     expect(html).toContain("Searching");
     expect(html).toContain("Grading");
   });
@@ -77,8 +77,8 @@ describe("ThinkingBlock", () => {
       />,
     );
 
-    expect(html).toContain("回答中");
-    expect(html).toContain("已切入回答");
+    expect(html).toContain("\u751f\u6210\u4e2d");
+    expect(html).toContain("Grading");
     expect(html).not.toContain("Checking whether the retrieved documents are sufficient.");
   });
 
@@ -92,7 +92,6 @@ describe("ThinkingBlock", () => {
       />,
     );
 
-    expect(html).toContain("已停止");
-    expect(html).toContain("已停止生成");
+    expect(html).toContain("\u5df2\u505c\u6b62");
   });
 });

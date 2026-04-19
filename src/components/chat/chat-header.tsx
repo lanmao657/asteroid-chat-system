@@ -46,7 +46,7 @@ export function ChatHeader({
         <div className={styles.statusBadge}>{status}</div>
         <button className={styles.secondaryButton} onClick={onCreateSession} type="button">
           <MessageSquarePlus size={16} />
-          <span>新建对话</span>
+          <span>新对话</span>
         </button>
       </div>
     </header>

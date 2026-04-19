@@ -18,10 +18,7 @@ export function ActivityPanel({ activities, formatTime, status }: ActivityPanelP
   return (
     <aside className={styles.activityPanel}>
       <div className={styles.activityPanelHeader}>
-        <div>
-          <div className={styles.activityEyebrow}>工具与检索</div>
-          <div className={styles.activityTitle}>运行轨迹</div>
-        </div>
+        <div className={styles.activityTitle}>轨迹</div>
         <button
           aria-expanded={isExpanded}
           className={styles.activityToggle}
@@ -39,7 +36,7 @@ export function ActivityPanel({ activities, formatTime, status }: ActivityPanelP
         </div>
         <div className={styles.activitySummaryBody}>
           <div className={styles.activitySummaryTitle}>
-            {latestActivity?.title ?? "等待本轮对话触发工具或检索"}
+            {latestActivity?.title ?? "暂无记录"}
           </div>
           <div className={styles.activitySummaryText}>{latestActivity?.body ?? status}</div>
         </div>
@@ -61,9 +58,7 @@ export function ActivityPanel({ activities, formatTime, status }: ActivityPanelP
               </article>
             ))
           ) : (
-            <div className={styles.activityEmpty}>
-              这里会展示检索、工具调用和记忆压缩等过程信息。
-            </div>
+            <div className={styles.activityEmpty}>暂无记录</div>
           )}
         </div>
       ) : null}

@@ -23,22 +23,16 @@ function isSameMotion(a: MotionVector, b: MotionVector) {
 
 const sceneCopy = {
   login: {
-    eyebrow: "安全入口",
-    title: "欢迎回来。",
-    description: "输入邮箱和密码，继续进入你的工作空间。",
+    eyebrow: "北辰知识助手",
+    title: "登录",
+    description: "进入工作区",
   },
   register: {
-    eyebrow: "快速开始",
-    title: "开始创建账号。",
-    description: "填写基础信息，几秒钟后就能进入你的工作空间。",
+    eyebrow: "北辰知识助手",
+    title: "注册",
+    description: "创建账号",
   },
 } as const;
-
-const metricCopy = [
-  { value: "邮箱登录", label: "直接进入" },
-  { value: "即时同步", label: "延续上次状态" },
-  { value: "受保护会话", label: "安全访问" },
-] as const;
 
 function createTranslateStyle(x: number, y: number, scale = 1): CSSProperties {
   return {
@@ -198,15 +192,6 @@ export function AuthShell({ mode }: { mode: AuthMode }) {
               </div>
             </div>
           </div>
-
-          <footer className={styles.sceneFooter}>
-            {metricCopy.map((metric) => (
-              <div className={styles.metric} key={metric.value}>
-                <span className={styles.metricValue}>{metric.value}</span>
-                <span className={styles.metricLabel}>{metric.label}</span>
-              </div>
-            ))}
-          </footer>
         </div>
       </section>
 

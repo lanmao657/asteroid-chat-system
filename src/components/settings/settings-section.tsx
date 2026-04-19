@@ -1,24 +1,31 @@
 import type { ReactNode } from "react";
 
+import { cn } from "@/lib/utils";
+
 export function SettingsSection({
   title,
   description,
   children,
+  className,
+  headerClassName,
+  contentClassName,
 }: {
   title: string;
-  description: string;
+  description?: string;
   children: ReactNode;
+  className?: string;
+  headerClassName?: string;
+  contentClassName?: string;
 }) {
   return (
-    <section className="overflow-hidden rounded-xl border border-black/10 bg-white">
-      <div className="border-b border-black/10 px-6 py-6 sm:px-8">
-        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.26em] text-black/35">
-          设置分区
-        </div>
-        <h2 className="mt-3 text-xl font-semibold tracking-tight text-black">{title}</h2>
-        <p className="mt-2 max-w-3xl text-sm leading-7 text-black/58">{description}</p>
+    <section className={cn("overflow-hidden", className)}>
+      <div className={cn("pb-4", headerClassName)}>
+        <h2 className="text-[1.05rem] font-medium tracking-[-0.02em] text-[#1f1f1d]">{title}</h2>
+        {description ? (
+          <p className="mt-2 text-sm leading-7 text-black/56">{description}</p>
+        ) : null}
       </div>
-      <div className="divide-y divide-black/10">{children}</div>
+      <div className={cn(contentClassName)}>{children}</div>
     </section>
   );
 }

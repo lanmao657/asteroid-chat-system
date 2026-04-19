@@ -34,10 +34,6 @@ export function AppSidebar({
             <div className={styles.logoMark}>
               <Sparkles size={16} strokeWidth={2.1} />
             </div>
-            <div>
-              <div className={styles.logoTitle}>内部知识助手</div>
-              <div className={styles.logoSub}>企业培训、制度问答与内部知识检索工作台</div>
-            </div>
           </div>
 
           <button
@@ -57,12 +53,12 @@ export function AppSidebar({
           type="button"
         >
           <MessageSquarePlus size={16} />
-          <span>新建对话</span>
+          <span>新对话</span>
         </button>
       </div>
 
       <div className={styles.sidebarSection}>
-        <div className={styles.sidebarLabel}>最近会话</div>
+        <div className={styles.sidebarLabel}>会话</div>
         <div className={styles.sessionList}>
           {sessions.map((session) => (
             <button
@@ -85,14 +81,6 @@ export function AppSidebar({
       </div>
 
       <div className={styles.sidebarFooter}>
-        <div className={styles.sidebarFooterCard}>
-          <div className={styles.sidebarFooterEyebrow}>Enterprise</div>
-          <div className={styles.sidebarFooterTitle}>企业培训与内部知识助手</div>
-          <div className={styles.sidebarFooterBody}>
-            优先围绕制度、流程、培训和案例来组织知识问答、复盘与检索。
-          </div>
-        </div>
-
         <Link className={styles.sidebarUtility} href="/settings">
           <span className={styles.sidebarUtilityIcon}>
             <Settings2 size={15} />

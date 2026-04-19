@@ -25,7 +25,9 @@ export function PromptSuggestions({
             <div className={styles.suggestionTitle}>{suggestion.title}</div>
             <ArrowUpRight size={16} />
           </div>
-          <div className={styles.suggestionDescription}>{suggestion.description}</div>
+          {suggestion.description ? (
+            <div className={styles.suggestionDescription}>{suggestion.description}</div>
+          ) : null}
         </button>
       ))}
     </div>

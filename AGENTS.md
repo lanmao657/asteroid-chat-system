@@ -176,11 +176,13 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 知识入库服务与状态流转以 `src/lib/knowledge/*` 为准。
 - 知识文档与 chunk 持久化以 `src/lib/db/knowledge-repository.ts`、`src/lib/db/schema.ts` 为准。
 - 知识入库 API 以 `src/app/api/knowledge/documents/*` 为准。
-- 设置页与知识管理分区以 `src/app/(app)/settings/page.tsx`、`src/components/settings/settings-page.tsx`、`src/components/knowledge/knowledge-workspace.tsx` 为准。
+- 设置页与知识管理分区以 `src/app/(app)/settings/page.tsx`、`src/app/(app)/@settingsModal/*`、`src/components/settings/settings-page.tsx`、`src/components/settings/settings-modal.tsx`、`src/components/knowledge/knowledge-workspace.tsx` 为准。
 
 项目事实补充：
 
 - 知识入库是独立受保护链路，不重写 `/api/chat` 主流程，也不改变聊天 SSE 契约。
+- `/settings` 在受保护工作区内采用“直达页 + 路由弹窗”双形态：硬刷新或直接访问 `/settings` 时渲染完整页面，从聊天工作区通过客户端导航进入 `/settings` 时由 `(app)` 并行路由渲染设置弹窗。
+- 设置导航当前只保留 `文档管理` 与 `账号信息` 两个分区；不要重新引入无业务实现的占位设置项。
 - 当前知识入库支持 `text/plain`、`text/markdown`、`application/pdf`。
 - 当前阶段不持久化原始二进制文件；只持久化文档元信息、`extracted_text` 与 `knowledge_chunks`。
 - 默认 chunk 切分与上传大小限制由 `KNOWLEDGE_BASE_CHUNK_SIZE`、`KNOWLEDGE_BASE_CHUNK_OVERLAP`、`KNOWLEDGE_BASE_MAX_FILE_SIZE` 控制。
@@ -194,6 +196,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 知识文档详情/删除 API：`src/app/api/knowledge/documents/[documentId]/route.ts`
 - 知识 chunk 列表 API：`src/app/api/knowledge/documents/[documentId]/chunks/route.ts`
 - 设置页：`src/app/(app)/settings/page.tsx`
+- 设置弹窗并行路由：`src/app/(app)/layout.tsx`、`src/app/(app)/@settingsModal/default.tsx`、`src/app/(app)/@settingsModal/(.)settings/page.tsx`
 - `/knowledge` 兼容旧入口并重定向到 `/settings`
 
 运行语义补充：
