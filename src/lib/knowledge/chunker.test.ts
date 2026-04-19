@@ -3,6 +3,21 @@ import { describe, expect, it } from "vitest";
 import { chunkText } from "@/lib/knowledge/chunker";
 
 describe("knowledge chunker", () => {
+  it("returns a single chunk for short text", () => {
+    const chunks = chunkText("Short paragraph", {
+      targetChunkSize: 120,
+      overlapSize: 20,
+    });
+
+    expect(chunks).toEqual([
+      {
+        chunkIndex: 0,
+        content: "Short paragraph",
+        charCount: "Short paragraph".length,
+      },
+    ]);
+  });
+
   it("prefers paragraph boundaries when splitting text", () => {
     const paragraphA = "A".repeat(360);
     const paragraphB = "B".repeat(360);

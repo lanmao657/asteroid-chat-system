@@ -165,6 +165,37 @@ describe("ingestKnowledgeFile", () => {
     });
   });
 
+  it("marks the document as failed when chunking produces no chunks", async () => {
+    chunkTextMock.mockReturnValueOnce([]);
+
+    const file = new File(["Parsed text"], "policy.txt", { type: "text/plain" });
+
+    await expect(
+      ingestKnowledgeFile({
+        userId: "user-1",
+        file,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: "The uploaded document did not produce any chunks.",
+    });
+
+    expect(updateKnowledgeDocumentStatusMock).toHaveBeenNthCalledWith(1, {
+      documentId: "doc-1",
+      userId: "user-1",
+      status: "parsed",
+      extractedText: "Parsed text",
+      errorMessage: null,
+    });
+    expect(updateKnowledgeDocumentStatusMock).toHaveBeenNthCalledWith(2, {
+      documentId: "doc-1",
+      userId: "user-1",
+      status: "failed",
+      errorMessage: "The uploaded document did not produce any chunks.",
+    });
+    expect(persistKnowledgeDocumentChunksMock).not.toHaveBeenCalled();
+  });
+
   it("marks the document as failed when pdf parsing throws", async () => {
     getDocumentTitleFromFilenameMock.mockReturnValueOnce("Guide");
     getSupportedMimeTypeMock.mockReturnValueOnce("application/pdf");

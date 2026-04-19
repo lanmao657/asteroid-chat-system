@@ -660,6 +660,10 @@ export const persistKnowledgeDocumentChunks = async ({
   userId,
   chunks,
 }: BulkInsertKnowledgeChunksInput) => {
+  if (chunks.length === 0) {
+    throw new Error("Knowledge document did not produce any chunks.");
+  }
+
   const pool = await getRequiredPool();
 
   return withTransaction(pool, async (client) => {

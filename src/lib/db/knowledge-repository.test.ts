@@ -280,6 +280,19 @@ describe("knowledge-repository", () => {
     expect(result.document.chunkCount).toBe(1);
   });
 
+  it("rejects empty chunks before marking the document as chunked", async () => {
+    await expect(
+      persistKnowledgeDocumentChunks({
+        documentId: "doc-1",
+        userId: "user-1",
+        chunks: [],
+      }),
+    ).rejects.toThrow("Knowledge document did not produce any chunks.");
+
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(transactionQuery).not.toHaveBeenCalled();
+  });
+
   it("lists chunks in chunk index order", async () => {
     query.mockResolvedValueOnce({
       rows: [
