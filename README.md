@@ -50,6 +50,9 @@ npm run dev
 | `KNOWLEDGE_BASE_CHUNK_SIZE` | 默认 chunk 字符长度 | `1200` |
 | `KNOWLEDGE_BASE_CHUNK_OVERLAP` | 默认 chunk overlap 字符长度 | `200` |
 | `KNOWLEDGE_BASE_MAX_FILE_SIZE` | 上传文件大小上限，单位 bytes | `5242880` |
+| `KNOWLEDGE_BASE_EMBEDDING_MODEL` | OpenAI-compatible embedding 模型 | `text-embedding-3-small` |
+| `KNOWLEDGE_BASE_EMBEDDING_BATCH_SIZE` | 单次 embedding 请求的 chunk 数 | `8` |
+| `KNOWLEDGE_BASE_EMBEDDING_TIMEOUT_MS` | embedding 请求超时，单位毫秒 | `30000` |
 | `JINA_API_KEY` | 可选 Jina Rerank API key | empty |
 | `JINA_RERANK_MODEL` | Jina rerank 模型 | `jina-reranker-v2-base-multilingual` |
 | `WEATHER_API_BASE_URL` | 天气查询服务地址 | `https://wttr.in` |
@@ -129,6 +132,7 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -f sql/init-postgres.sql
 ```
 
 This project also lazily creates the table on first successful database write, so manual init is optional for local development.
+The same `sql/init-postgres.sql` script also upgrades existing local databases with the knowledge embedding columns by using `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
 
 ### Persisted tables
 
@@ -203,6 +207,7 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
 
 - Internal knowledge retrieval now reads from persisted `knowledge_chunks`, scoped to the current authenticated user.
 - The default retrieval path is PostgreSQL text search with lightweight keyword fallback. No vector database is required for this phase.
+- Embedding vectors are now persisted on `knowledge_chunks` through the OpenAI-compatible `/embeddings` API, but retrieval still stays on the existing PostgreSQL text path for now.
 - Assistant answers may include `citations` metadata in `chat_messages.metadata`, and the existing chat UI renders those citations under assistant messages.
 - New retrieval envs:
   - `KNOWLEDGE_BASE_MAX_RESULTS`
@@ -214,11 +219,16 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
 
 - Knowledge ingestion is a separate protected flow. It does not rewrite `/api/chat`, the SSE contract, or the existing chat workspace data flow.
 - Uploaded source files are parsed on the server and discarded after ingestion. This phase stores document metadata, extracted text, and chunks in PostgreSQL only.
+- After chunk persistence, the server automatically attempts chunk-level embedding generation. Embedding failures do not roll back the document to a non-`chunked` state; they are tracked on each chunk instead.
 - Supported upload types are `text/plain`, `text/markdown`, and `application/pdf`.
 - Default chunking and upload limits are controlled by:
   - `KNOWLEDGE_BASE_CHUNK_SIZE`
   - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
   - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+- Default embedding behavior is controlled by:
+  - `KNOWLEDGE_BASE_EMBEDDING_MODEL`
+  - `KNOWLEDGE_BASE_EMBEDDING_BATCH_SIZE`
+  - `KNOWLEDGE_BASE_EMBEDDING_TIMEOUT_MS`
 - The protected settings page is available at `/settings`, and it now contains both account actions and the knowledge base management UI. The legacy `/knowledge` route redirects there.
 
 ### Knowledge APIs
@@ -232,6 +242,8 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
   - Returns the current user's document detail, including `extractedText`.
 - `GET /api/knowledge/documents/<documentId>/chunks`
   - Returns the current user's chunk list for the document.
+- `POST /api/knowledge/documents/<documentId>/embeddings`
+  - Re-runs embedding for the current user's pending or failed chunks under that document.
 - `DELETE /api/knowledge/documents/<documentId>`
   - Deletes the current user's document and cascades chunk deletion through PostgreSQL foreign keys.
 
@@ -240,6 +252,8 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
 - `knowledge_documents.status` progresses through `uploaded`, `parsed`, `chunked`, or `failed`.
 - Parse or ingest failures persist `error_message` on the document row.
 - Final chunk persistence and document finalization run in one PostgreSQL transaction so the document does not end up marked `chunked` without persisted chunks.
+- `knowledge_chunks.embedding_status` progresses through `pending`, `ready`, or `failed`.
+- Chunk embedding failures persist `embedding_error_message`, and successful writes clear any prior chunk-level embedding error.
 
 ### Knowledge Tables
 
@@ -265,7 +279,10 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
 - `chunk_index`: stable in-document order
 - `content`: chunk text
 - `char_count`: chunk size in characters
-- `embedding_status`: reserved for the next phase, defaults to `pending`
+- `embedding_status`: `pending`, `ready`, or `failed`
+- `embedding_vector`: persisted embedding vector stored as JSONB for a later vector or hybrid retrieval phase
+- `embedding_provider` / `embedding_model` / `embedding_dimensions`: stable embedding metadata for later retrieval work
+- `embedding_error_message`: persisted per-chunk failure reason when embedding generation fails
 - `metadata`: reserved JSONB payload for future retrieval/indexing extensions
 - `created_at`: chunk timestamp
 
@@ -275,4 +292,6 @@ psql postgresql://lanmao:550695@localhost:5432/mydb -c "select run_id, session_i
 2. Open `http://localhost:3000/settings`.
 3. Upload a `txt`, `md`, or `pdf` file smaller than the configured `KNOWLEDGE_BASE_MAX_FILE_SIZE` limit. The default is 5 MB.
 4. Confirm the document reaches `chunked` (or `failed`) and appears in the settings list with the latest status and timestamp.
-5. Delete the document and confirm it disappears from the list.
+5. Optionally call `POST /api/knowledge/documents/<documentId>/embeddings` to re-run embedding for an existing document.
+6. Inspect `knowledge_chunks` and confirm `embedding_status` moves to `ready` or `failed`, with `embedding_error_message` filled when needed.
+7. Delete the document and confirm it disappears from the list.

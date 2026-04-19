@@ -35,10 +35,12 @@ import {
   getKnowledgeChunksByIds,
   getKnowledgeDocumentMetaByIds,
   getKnowledgeDocumentById,
+  listKnowledgeChunksForEmbedding,
   listKnowledgeChunksByDocument,
   listKnowledgeDocumentsByUser,
   persistKnowledgeDocumentChunks,
   searchKnowledgeChunksByUser,
+  updateKnowledgeChunkEmbedding,
   updateKnowledgeDocumentStatus,
 } from "./knowledge-repository";
 
@@ -444,6 +446,200 @@ describe("knowledge-repository", () => {
         updatedAt: "2026-04-13T00:03:00.000Z",
       },
     ]);
+  });
+
+  it("lists pending or failed chunks for embedding backfill", async () => {
+    query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "chunk-1",
+          document_id: "doc-1",
+          user_id: "user-1",
+          chunk_index: 0,
+          content: "First chunk",
+          char_count: 11,
+          embedding_status: "pending",
+          embedding_provider: null,
+          embedding_model: null,
+          embedding_dimensions: null,
+          embedding_error_message: null,
+          metadata: {},
+          created_at: new Date("2026-04-13T00:02:00.000Z"),
+        },
+      ],
+    });
+
+    const result = await listKnowledgeChunksForEmbedding({
+      userId: "user-1",
+      documentId: "doc-1",
+      limit: 25,
+      statuses: ["pending", "failed"],
+    });
+
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      "user-1",
+      ["pending", "failed"],
+      25,
+      [],
+      "doc-1",
+    ]);
+    expect(result).toEqual([
+      expect.objectContaining({
+        id: "chunk-1",
+        documentId: "doc-1",
+        embeddingStatus: "pending",
+      }),
+    ]);
+  });
+
+  it("passes excluded chunk ids when paging embedding backfill", async () => {
+    query.mockResolvedValueOnce({
+      rows: [],
+    });
+
+    await listKnowledgeChunksForEmbedding({
+      userId: "user-1",
+      limit: 50,
+      statuses: ["pending"],
+      excludeChunkIds: ["chunk-1", "chunk-2"],
+    });
+
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      "user-1",
+      ["pending"],
+      50,
+      ["chunk-1", "chunk-2"],
+    ]);
+  });
+
+  it("persists embedding readiness and clears previous chunk errors", async () => {
+    query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "chunk-1",
+          document_id: "doc-1",
+          user_id: "user-1",
+          chunk_index: 0,
+          content: "First chunk",
+          char_count: 11,
+          embedding_status: "ready",
+          embedding_provider: "openai-compatible",
+          embedding_model: "text-embedding-3-small",
+          embedding_dimensions: 3,
+          embedding_error_message: null,
+          metadata: {},
+          created_at: new Date("2026-04-13T00:02:00.000Z"),
+        },
+      ],
+    });
+
+    const result = await updateKnowledgeChunkEmbedding({
+      chunkId: "chunk-1",
+      userId: "user-1",
+      embeddingStatus: "ready",
+      embeddingVector: [0.1, 0.2, 0.3],
+      embeddingProvider: "openai-compatible",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 3,
+      embeddingErrorMessage: null,
+    });
+
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      "chunk-1",
+      "user-1",
+      "ready",
+      "[0.1,0.2,0.3]",
+      "openai-compatible",
+      "text-embedding-3-small",
+      3,
+      null,
+    ]);
+    expect(result).toEqual({
+      skipped: false,
+      record: expect.objectContaining({
+        id: "chunk-1",
+        embeddingStatus: "ready",
+        embedding: {
+          provider: "openai-compatible",
+          model: "text-embedding-3-small",
+          dimensions: 3,
+        },
+        embeddingErrorMessage: null,
+      }),
+    });
+  });
+
+  it("persists embedding failures and keeps the chunk write actionable", async () => {
+    query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "chunk-2",
+          document_id: "doc-1",
+          user_id: "user-1",
+          chunk_index: 1,
+          content: "Second chunk",
+          char_count: 12,
+          embedding_status: "failed",
+          embedding_provider: null,
+          embedding_model: null,
+          embedding_dimensions: null,
+          embedding_error_message: "rate limited",
+          metadata: {},
+          created_at: new Date("2026-04-13T00:02:01.000Z"),
+        },
+      ],
+    });
+
+    const result = await updateKnowledgeChunkEmbedding({
+      chunkId: "chunk-2",
+      userId: "user-1",
+      embeddingStatus: "failed",
+      embeddingVector: null,
+      embeddingProvider: null,
+      embeddingModel: null,
+      embeddingDimensions: null,
+      embeddingErrorMessage: "rate limited",
+      skipIfAlreadyReady: true,
+    });
+
+    expect(String(query.mock.calls[0]?.[0])).toContain(
+      "WHERE id = $1 AND user_id = $2 AND embedding_status <> 'ready'",
+    );
+    expect(result).toEqual({
+      skipped: false,
+      record: expect.objectContaining({
+        id: "chunk-2",
+        embeddingStatus: "failed",
+        embedding: null,
+        embeddingErrorMessage: "rate limited",
+      }),
+    });
+  });
+
+  it("returns skipped when a protected update loses the race to a ready chunk", async () => {
+    query.mockResolvedValueOnce({
+      rows: [],
+    });
+
+    const result = await updateKnowledgeChunkEmbedding({
+      chunkId: "chunk-3",
+      userId: "user-1",
+      embeddingStatus: "failed",
+      embeddingVector: null,
+      embeddingProvider: null,
+      embeddingModel: null,
+      embeddingDimensions: null,
+      embeddingErrorMessage: "late failure",
+      skipIfAlreadyReady: true,
+    });
+
+    expect(String(query.mock.calls[0]?.[0])).toContain(
+      "WHERE id = $1 AND user_id = $2 AND embedding_status <> 'ready'",
+    );
+    expect(result).toEqual({
+      record: null,
+      skipped: true,
+    });
   });
 
   it("throws a clear error when the database is unavailable", async () => {

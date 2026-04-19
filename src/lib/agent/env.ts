@@ -88,6 +88,16 @@ export const agentEnv = {
     process.env.KNOWLEDGE_BASE_MAX_FILE_SIZE,
     5 * 1024 * 1024,
   ),
+  knowledgeBaseEmbeddingModel:
+    process.env.KNOWLEDGE_BASE_EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
+  knowledgeBaseEmbeddingBatchSize: asNumber(
+    process.env.KNOWLEDGE_BASE_EMBEDDING_BATCH_SIZE,
+    8,
+  ),
+  knowledgeBaseEmbeddingTimeoutMs: asNumber(
+    process.env.KNOWLEDGE_BASE_EMBEDDING_TIMEOUT_MS,
+    30_000,
+  ),
   jinaApiKey: process.env.JINA_API_KEY?.trim() || "",
   jinaRerankModel: process.env.JINA_RERANK_MODEL?.trim() || "jina-reranker-v2-base-multilingual",
   weatherApiBaseUrl:

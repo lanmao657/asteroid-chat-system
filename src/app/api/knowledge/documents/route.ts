@@ -1,6 +1,9 @@
+import { after } from "next/server";
+
 import { requireApiSession } from "@/lib/auth/session";
 import { listKnowledgeDocumentsByUser } from "@/lib/db/knowledge-repository";
 import { DATABASE_NOT_CONFIGURED_MESSAGE, isDatabaseConfigured } from "@/lib/db/env";
+import { embedKnowledgeChunks } from "@/lib/knowledge/embedding";
 import { ingestKnowledgeFile, KnowledgeIngestError } from "@/lib/knowledge/ingest";
 import { toKnowledgeDocumentSummary } from "@/lib/knowledge/presentation";
 
@@ -85,6 +88,17 @@ export async function POST(request: Request) {
     const result = await ingestKnowledgeFile({
       userId: authResult.session.user.id,
       file,
+    });
+
+    after(async () => {
+      try {
+        await embedKnowledgeChunks({
+          userId: authResult.session.user.id,
+          documentId: result.document.id,
+        });
+      } catch (embeddingError) {
+        console.error("Failed to embed knowledge document chunks:", embeddingError);
+      }
     });
 
     return Response.json(

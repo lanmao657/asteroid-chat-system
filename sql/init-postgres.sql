@@ -72,10 +72,30 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
   content TEXT NOT NULL,
   char_count INTEGER NOT NULL,
   embedding_status TEXT NOT NULL CHECK (embedding_status IN ('pending', 'ready', 'failed')) DEFAULT 'pending',
+  embedding_vector JSONB,
+  embedding_provider TEXT,
+  embedding_model TEXT,
+  embedding_dimensions INTEGER,
+  embedding_error_message TEXT,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (document_id, chunk_index)
 );
+
+ALTER TABLE knowledge_chunks
+  ADD COLUMN IF NOT EXISTS embedding_vector JSONB;
+
+ALTER TABLE knowledge_chunks
+  ADD COLUMN IF NOT EXISTS embedding_provider TEXT;
+
+ALTER TABLE knowledge_chunks
+  ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+
+ALTER TABLE knowledge_chunks
+  ADD COLUMN IF NOT EXISTS embedding_dimensions INTEGER;
+
+ALTER TABLE knowledge_chunks
+  ADD COLUMN IF NOT EXISTS embedding_error_message TEXT;
 
 CREATE INDEX IF NOT EXISTS knowledge_documents_user_id_updated_at_idx
   ON knowledge_documents (user_id, updated_at DESC);

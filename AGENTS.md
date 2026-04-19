@@ -80,6 +80,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
   - `KNOWLEDGE_BASE_CHUNK_SIZE`
   - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
   - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+  - `KNOWLEDGE_BASE_EMBEDDING_MODEL`
+  - `KNOWLEDGE_BASE_EMBEDDING_BATCH_SIZE`
+  - `KNOWLEDGE_BASE_EMBEDDING_TIMEOUT_MS`
   - `KNOWLEDGE_BASE_MAX_RESULTS`
   - `KNOWLEDGE_BASE_MIN_SCORE`
   - `KNOWLEDGE_BASE_ENABLE_RERANK`
@@ -187,7 +190,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 当前阶段不持久化原始二进制文件；只持久化文档元信息、`extracted_text` 与 `knowledge_chunks`。
 - 默认 chunk 切分与上传大小限制由 `KNOWLEDGE_BASE_CHUNK_SIZE`、`KNOWLEDGE_BASE_CHUNK_OVERLAP`、`KNOWLEDGE_BASE_MAX_FILE_SIZE` 控制。
 - `knowledge_documents.status` 使用 `uploaded / parsed / chunked / failed`。
-- `knowledge_chunks.embedding_status` 当前只作为后续 embedding 阶段预留，默认 `pending`。
+- chunk 持久化后会继续尝试调用 OpenAI-compatible `/embeddings` 接口生成向量；向量与元数据持久化在 `knowledge_chunks` 上，不引入额外向量数据库。
+- `knowledge_chunks.embedding_status` 使用 `pending / ready / failed`。
+- 单个 chunk embedding 失败时必须记录 `embedding_error_message`，且不能把整个文档静默吞掉或回滚成未 chunked。
 - 所有知识文档与 chunk 查询、详情、删除都必须带 `user_id` 做数据隔离。
 
 关键路径补充：
@@ -195,15 +200,17 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - 知识入库 API：`src/app/api/knowledge/documents/route.ts`
 - 知识文档详情/删除 API：`src/app/api/knowledge/documents/[documentId]/route.ts`
 - 知识 chunk 列表 API：`src/app/api/knowledge/documents/[documentId]/chunks/route.ts`
+- 知识 embedding 回填 API：`src/app/api/knowledge/documents/[documentId]/embeddings/route.ts`
 - 设置页：`src/app/(app)/settings/page.tsx`
 - 设置弹窗并行路由：`src/app/(app)/layout.tsx`、`src/app/(app)/@settingsModal/default.tsx`、`src/app/(app)/@settingsModal/(.)settings/page.tsx`
 - `/knowledge` 兼容旧入口并重定向到 `/settings`
 
 运行语义补充：
 
-- `/api/knowledge/documents`、`/api/knowledge/documents/[documentId]`、`/api/knowledge/documents/[documentId]/chunks` 都是鉴权后的 `nodejs` Route Handlers。
+- `/api/knowledge/documents`、`/api/knowledge/documents/[documentId]`、`/api/knowledge/documents/[documentId]/chunks`、`/api/knowledge/documents/[documentId]/embeddings` 都是鉴权后的 `nodejs` Route Handlers。
 - 缺少 `DATABASE_URL` 时，知识入库与知识管理接口返回数据库未配置错误，不提供匿名或内存降级。
 - 文档入库流程先写 `knowledge_documents`，再解析文本、切分 chunk，并在事务内完成 chunk 持久化与最终 `chunked` 状态更新。
+- embedding 流程默认在 chunk 持久化后触发；如果 embedding 失败，文档仍保持 `chunked`，失败信息落在 chunk 级别并允许后续回填重试。
 - 解析或入库失败时，文档状态必须落为 `failed`，并记录 `error_message`。
 - 删除知识文档时只删除文档主记录，`knowledge_chunks` 通过外键 `ON DELETE CASCADE` 联动删除。
 
@@ -212,6 +219,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - `knowledge_documents` 与 `knowledge_chunks` 表结构、索引和状态枚举与代码保持一致。
 - 知识 API 仍然保持鉴权保护，且只允许访问当前登录用户自己的文档与 chunks。
 - 文档失败状态仍然会持久化 `error_message`，不会留下“文档成功但 chunks 半写入”的脏状态。
+- chunk embedding 结果、向量元数据、失败信息与 `embedding_status` 必须与代码行为一致，且回填只允许处理当前用户自己的文档。
 - 如果知识入库支持的文件类型、文件存储策略、状态流转、事务边界或知识 API 行为发生变化，必须同步更新 `AGENTS.md` 与 `README.md`。
 ## 8. Knowledge Retrieval
 
@@ -226,6 +234,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
   - `KNOWLEDGE_BASE_CHUNK_SIZE`
   - `KNOWLEDGE_BASE_CHUNK_OVERLAP`
   - `KNOWLEDGE_BASE_MAX_FILE_SIZE`
+  - `KNOWLEDGE_BASE_EMBEDDING_MODEL`
+  - `KNOWLEDGE_BASE_EMBEDDING_BATCH_SIZE`
+  - `KNOWLEDGE_BASE_EMBEDDING_TIMEOUT_MS`
   - `JINA_API_KEY`
   - `JINA_RERANK_MODEL`
 - Assistant source citations may be returned in `/api/chat` through existing assistant message metadata and persisted in `chat_messages.metadata`; do not add a new SSE event type just for citations in this phase.

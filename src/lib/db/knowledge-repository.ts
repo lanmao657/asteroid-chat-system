@@ -12,6 +12,8 @@ import {
 import type { KnowledgeChunkSearchResult } from "@/lib/agent/types";
 import type {
   KnowledgeChunkInput,
+  KnowledgeChunkEmbeddingRecord,
+  KnowledgeChunkEmbeddingStatus,
   KnowledgeChunkRecord,
   KnowledgeDocumentRecord,
   KnowledgeDocumentStatus,
@@ -69,6 +71,31 @@ export interface GetKnowledgeDocumentMetaByIdsInput {
   documentIds: string[];
 }
 
+export interface ListKnowledgeChunksForEmbeddingInput {
+  userId: string;
+  documentId?: string;
+  limit?: number;
+  statuses?: KnowledgeChunkEmbeddingStatus[];
+  excludeChunkIds?: string[];
+}
+
+export interface UpdateKnowledgeChunkEmbeddingInput {
+  chunkId: string;
+  userId: string;
+  embeddingStatus: KnowledgeChunkEmbeddingStatus;
+  embeddingVector?: number[] | null;
+  embeddingProvider?: string | null;
+  embeddingModel?: string | null;
+  embeddingDimensions?: number | null;
+  embeddingErrorMessage?: string | null;
+  skipIfAlreadyReady?: boolean;
+}
+
+export interface UpdateKnowledgeChunkEmbeddingResult {
+  record: KnowledgeChunkRecord | null;
+  skipped: boolean;
+}
+
 export interface KnowledgeDocumentMeta {
   documentId: string;
   title: string;
@@ -99,6 +126,10 @@ interface KnowledgeChunkRow {
   content: string;
   char_count: number;
   embedding_status: "pending" | "ready" | "failed";
+  embedding_provider: string | null;
+  embedding_model: string | null;
+  embedding_dimensions: number | null;
+  embedding_error_message: string | null;
   metadata: Record<string, unknown>;
   created_at: Date;
 }
@@ -149,6 +180,15 @@ const mapChunkRow = (row: KnowledgeChunkRow): KnowledgeChunkRecord => ({
   content: row.content,
   charCount: row.char_count,
   embeddingStatus: row.embedding_status,
+  embedding:
+    row.embedding_provider && row.embedding_model && row.embedding_dimensions
+      ? ({
+          provider: row.embedding_provider,
+          model: row.embedding_model,
+          dimensions: row.embedding_dimensions,
+        } satisfies KnowledgeChunkEmbeddingRecord)
+      : null,
+  embeddingErrorMessage: row.embedding_error_message,
   metadata: row.metadata ?? {},
   createdAt: row.created_at.toISOString(),
 });
@@ -293,7 +333,7 @@ const buildInsertChunkStatement = ({
       JSON.stringify(chunk.metadata ?? {}),
     );
 
-    return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, 'pending', $${offset + 7}::jsonb)`;
+    return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, 'pending', NULL, NULL, NULL, NULL, $${offset + 7}::jsonb)`;
   });
 
   return {
@@ -306,6 +346,11 @@ const buildInsertChunkStatement = ({
         content,
         char_count,
         embedding_status,
+        embedding_vector,
+        embedding_provider,
+        embedding_model,
+        embedding_dimensions,
+        embedding_error_message,
         metadata
       )
       VALUES ${placeholders.join(", ")}
@@ -503,6 +548,107 @@ export const listKnowledgeChunksByDocument = async ({
   );
 
   return result.rows.map(mapChunkRow);
+};
+
+export const listKnowledgeChunksForEmbedding = async ({
+  userId,
+  documentId,
+  limit = 50,
+  statuses = ["pending", "failed"],
+  excludeChunkIds = [],
+}: ListKnowledgeChunksForEmbeddingInput) => {
+  if (statuses.length === 0) {
+    return [] satisfies KnowledgeChunkRecord[];
+  }
+
+  const pool = await getRequiredPool();
+  const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 200);
+  const values: unknown[] = [userId, statuses, safeLimit, excludeChunkIds];
+  const documentFilter =
+    documentId != null
+      ? (() => {
+          values.push(documentId);
+          return `AND chunk.document_id = $${values.length}`;
+        })()
+      : "";
+
+  const result = await pool.query<KnowledgeChunkRow>(
+    `
+      SELECT chunk.*
+      FROM ${KNOWLEDGE_CHUNKS_TABLE} AS chunk
+      INNER JOIN ${KNOWLEDGE_DOCUMENTS_TABLE} AS document
+        ON document.id = chunk.document_id
+      WHERE chunk.user_id = $1
+        AND document.user_id = $1
+        AND document.status = 'chunked'
+        AND chunk.embedding_status = ANY($2::text[])
+        AND NOT (chunk.id = ANY($4::text[]))
+        ${documentFilter}
+      ORDER BY chunk.created_at ASC, chunk.chunk_index ASC
+      LIMIT $3
+    `,
+    values,
+  );
+
+  return result.rows.map(mapChunkRow);
+};
+
+export const updateKnowledgeChunkEmbedding = async ({
+  chunkId,
+  userId,
+  embeddingStatus,
+  embeddingVector,
+  embeddingProvider,
+  embeddingModel,
+  embeddingDimensions,
+  embeddingErrorMessage,
+  skipIfAlreadyReady = false,
+}: UpdateKnowledgeChunkEmbeddingInput): Promise<UpdateKnowledgeChunkEmbeddingResult> => {
+  const pool = await getRequiredPool();
+  const values: unknown[] = [chunkId, userId, embeddingStatus];
+  const sets = ["embedding_status = $3"];
+
+  if (embeddingVector !== undefined) {
+    values.push(embeddingVector == null ? null : JSON.stringify(embeddingVector));
+    sets.push(`embedding_vector = $${values.length}::jsonb`);
+  }
+
+  if (embeddingProvider !== undefined) {
+    values.push(embeddingProvider);
+    sets.push(`embedding_provider = $${values.length}`);
+  }
+
+  if (embeddingModel !== undefined) {
+    values.push(embeddingModel);
+    sets.push(`embedding_model = $${values.length}`);
+  }
+
+  if (embeddingDimensions !== undefined) {
+    values.push(embeddingDimensions);
+    sets.push(`embedding_dimensions = $${values.length}`);
+  }
+
+  if (embeddingErrorMessage !== undefined) {
+    values.push(embeddingErrorMessage);
+    sets.push(`embedding_error_message = $${values.length}`);
+  }
+
+  const readyGuard = skipIfAlreadyReady ? " AND embedding_status <> 'ready'" : "";
+
+  const result = await pool.query<KnowledgeChunkRow>(
+    `
+      UPDATE ${KNOWLEDGE_CHUNKS_TABLE}
+      SET ${sets.join(", ")}
+      WHERE id = $1 AND user_id = $2${readyGuard}
+      RETURNING *
+    `,
+    values,
+  );
+
+  return {
+    record: result.rows[0] ? mapChunkRow(result.rows[0]) : null,
+    skipped: skipIfAlreadyReady && result.rows.length === 0,
+  };
 };
 
 export const getKnowledgeChunksByIds = async ({

@@ -2,6 +2,12 @@ export type KnowledgeDocumentStatus = "uploaded" | "parsed" | "chunked" | "faile
 
 export type KnowledgeChunkEmbeddingStatus = "pending" | "ready" | "failed";
 
+export interface KnowledgeChunkEmbeddingRecord {
+  provider: string;
+  model: string;
+  dimensions: number;
+}
+
 export interface KnowledgeChunkInput {
   id?: string;
   chunkIndex: number;
@@ -19,6 +25,8 @@ export interface KnowledgeChunkRecord {
   content: string;
   charCount: number;
   embeddingStatus: KnowledgeChunkEmbeddingStatus;
+  embedding: KnowledgeChunkEmbeddingRecord | null;
+  embeddingErrorMessage: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
 }

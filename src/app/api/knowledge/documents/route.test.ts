@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
+  afterMock,
+  embedKnowledgeChunksMock,
   ingestKnowledgeFileMock,
   isDatabaseConfiguredMock,
   listKnowledgeDocumentsByUserMock,
   requireApiSessionMock,
 } = vi.hoisted(() => ({
+  afterMock: vi.fn(),
+  embedKnowledgeChunksMock: vi.fn(),
   ingestKnowledgeFileMock: vi.fn(),
   isDatabaseConfiguredMock: vi.fn(),
   listKnowledgeDocumentsByUserMock: vi.fn(),
@@ -13,6 +17,10 @@ const {
 }));
 
 vi.mock("server-only", () => ({}));
+
+vi.mock("next/server", () => ({
+  after: afterMock,
+}));
 
 vi.mock("@/lib/auth/session", () => ({
   requireApiSession: requireApiSessionMock,
@@ -25,6 +33,10 @@ vi.mock("@/lib/db/knowledge-repository", () => ({
 vi.mock("@/lib/db/env", () => ({
   DATABASE_NOT_CONFIGURED_MESSAGE: "DATABASE_URL is not configured on the server.",
   isDatabaseConfigured: isDatabaseConfiguredMock,
+}));
+
+vi.mock("@/lib/knowledge/embedding", () => ({
+  embedKnowledgeChunks: embedKnowledgeChunksMock,
 }));
 
 vi.mock("@/lib/knowledge/ingest", async () => {
@@ -43,6 +55,8 @@ import { GET, POST } from "./route";
 
 describe("GET/POST /api/knowledge/documents", () => {
   beforeEach(() => {
+    afterMock.mockReset();
+    embedKnowledgeChunksMock.mockReset();
     ingestKnowledgeFileMock.mockReset();
     isDatabaseConfiguredMock.mockReset();
     listKnowledgeDocumentsByUserMock.mockReset();
@@ -131,6 +145,7 @@ describe("GET/POST /api/knowledge/documents", () => {
 
     expect(response.status).toBe(201);
     expect(ingestKnowledgeFileMock).toHaveBeenCalledTimes(1);
+    expect(afterMock).toHaveBeenCalledTimes(1);
     await expect(response.json()).resolves.toEqual({
       item: {
         id: "doc-1",
@@ -143,6 +158,50 @@ describe("GET/POST /api/knowledge/documents", () => {
         createdAt: "2026-04-13T00:00:00.000Z",
         updatedAt: "2026-04-13T00:01:00.000Z",
       },
+    });
+  });
+
+  it("schedules embedding after the upload response is created", async () => {
+    let scheduledCallback: (() => Promise<void> | void) | undefined;
+    afterMock.mockImplementationOnce((callback: () => Promise<void> | void) => {
+      scheduledCallback = callback;
+    });
+    ingestKnowledgeFileMock.mockResolvedValueOnce({
+      document: {
+        id: "doc-1",
+        userId: "user-1",
+        title: "Policy",
+        originalFilename: "policy.txt",
+        mimeType: "text/plain",
+        fileSize: 128,
+        extractedText: "content",
+        status: "chunked",
+        errorMessage: null,
+        chunkCount: 2,
+        createdAt: "2026-04-13T00:00:00.000Z",
+        updatedAt: "2026-04-13T00:01:00.000Z",
+      },
+    });
+
+    const formData = new FormData();
+    formData.set("file", new File(["policy text"], "policy.txt", { type: "text/plain" }));
+
+    const response = await POST(
+      new Request("http://localhost/api/knowledge/documents", {
+        method: "POST",
+        body: formData,
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(embedKnowledgeChunksMock).not.toHaveBeenCalled();
+    expect(scheduledCallback).toBeTypeOf("function");
+
+    await scheduledCallback?.();
+
+    expect(embedKnowledgeChunksMock).toHaveBeenCalledWith({
+      userId: "user-1",
+      documentId: "doc-1",
     });
   });
 
